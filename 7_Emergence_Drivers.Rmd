@@ -1,0 +1,787 @@
+---
+title: "7_Emergence_Drivers"
+author: "Yuting Deng"
+date: "2024-06-26"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Model Preparation
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r load package}
+library(mgcv)
+library(lme4)
+library(GGally)
+library(mgcViz)
+library(viridis)
+library(MuMIn)
+library(dplyr)
+library(readr)
+library(stringr)
+library(tidyr)
+library(ggcorrplot)
+library(rstatix)
+library(scales)
+```
+
+```{r prepare env covariates}
+combined_df = read_csv("./Data/10_count_env_df.csv")
+
+combined_df$roost_type <- as.factor(combined_df$roost_type)
+combined_df$colony <- as.factor(combined_df$colony)
+```
+
+```{r}
+# Prepare data. Combine all env csvs into one.
+library(fs)
+library(lunar)
+
+specific_hours <- c(18, 21)
+roost_daily_env = data.frame()
+
+for (i in dir_ls("./Data/env/", glob = "*.csv")){
+  file = read.csv(i) %>% 
+    filter(cluster_ID %in% unique(count.df$cluster_ID))
+  file$time = as.POSIXct(file$time, tz = "America/Chicago")
+  variable = colnames(file)[3]
+  file = file %>% 
+    mutate(date = date(time),
+           hour = hour(time)) %>% 
+    group_by(cluster_ID, date) %>% 
+    mutate(night_mean = mean(get(variable)[hour %in% specific_hours], na.rm = TRUE),
+           day_mean = mean(get(variable), na.rm = TRUE))
+  
+  file_sum = file[c("cluster_ID", "date", "night_mean", "day_mean")] %>% 
+    unique()
+  file_sum$variable = variable
+  
+  roost_daily_env = rbind(roost_daily_env, file_sum)
+}
+
+write.csv(roost_daily_env, "./Data/9_roost_daily_env.csv", row.names=FALSE)
+
+lunar = data.frame(date = unique(roost_daily_env$date)) %>% 
+  mutate(night_mean = lunar.illumination(date, shift = -10),
+         day_mean = night_mean,
+         variable = "lunar.illumination")
+
+id_df <- data.frame(cluster_ID = unique(roost_daily_env$cluster_ID))
+expanded_lunar <- lunar %>%
+  crossing(id_df)
+
+roost_daily_env = rbind(roost_daily_env, expanded_lunar)
+
+# plot to see correlations
+
+ggplot(roost_daily_env %>% filter(cluster_ID == 0 & date >= as.Date("2000-01-01") & date <= as.Date("2000-12-31") & variable == c("air.2m", "air.sfc")), 
+       aes(x = date, y = night_mean, color = variable)) +
+  geom_line() +
+  labs(title = "Night Temperature Variations Over Time",
+       x = "Local Date",
+       y = "Temperature (K)",
+       color = "Variable") +
+  theme_minimal()
+
+
+expanded_roost_nightly_env <- roost_daily_env[c("cluster_ID", "date", "night_mean", "variable")] %>%
+  spread(key = variable, value = night_mean)
+
+expanded_roost_daily_env <- roost_daily_env[c("cluster_ID", "date", "day_mean", "variable")] %>%
+  spread(key = variable, value = day_mean)
+
+expanded_roost_env = merge(expanded_roost_nightly_env, expanded_roost_daily_env, 
+                           by = c("cluster_ID", "date", "lunar.illumination"), 
+                           suffixes = c(".night", ".daily"))
+colnames(expanded_roost_env)[2] = "local_date"
+expanded_roost_env$cluster_ID = as.character(expanded_roost_env$cluster_ID)
+
+write.csv(expanded_roost_env, "./Data/9.5_expanded_roost_env.csv", row.names=FALSE)
+
+#------------------------------
+# Prepare Drought data
+path <- "./Data/env/Drought_index"
+file_list <- list.files(path, pattern = "*.csv", full.names = TRUE)
+data_list <- list()
+
+for (file in file_list) {
+  file_name <- tools::file_path_sans_ext(basename(file))
+  
+  df <- read_csv(file) %>%
+    mutate(Source = file_name,
+           year = str_sub(.data[[colnames(df)[1]]], start = 7, end = 10)) %>% 
+    select(-colnames(df)[1]) %>% gather("month", "drought_index", -Source, -year)
+  
+  data_list[[file_name]] <- df
+}
+
+combined_data_list <- bind_rows(data_list)
+
+combined_data_list = combined_data_list %>%
+mutate(month = recode(month,
+  January = 1,
+  February = 2,
+  March = 3,
+  April = 4,
+  May = 5,
+  June = 6,
+  July = 7,
+  August = 8,
+  September = 9,
+  October = 10,
+  November = 11,
+  December = 12
+))
+
+combined_data_list <- combined_data_list %>%
+  mutate(Date = as.Date(paste(year, month, "01", sep = "-"))) %>%
+  filter(drought_index != -99.99) 
+
+combined_data_list <- combined_data_list %>%
+  group_by(Date) %>% 
+  mutate(avg_drought_index = mean(drought_index))
+
+write.csv(combined_data_list, "./Data/env/drought_index.csv", row.names=FALSE)
+
+# Plot all three sources on the same ggplot
+ggplot(combined_data_list, aes(x = Date, y = drought_index, color = Source)) +
+  geom_line() +
+  geom_line(aes(x=Date, y=avg_drought_index), color="black")+
+  labs(title = "Drought Index Over Time",
+       x = "Time",
+       y = "Drought Index",
+       color = "Source") +
+  theme_minimal()
+
+
+#------------------------ 
+# Moonrise
+colony_info_gps <- read_csv("./Data/colony_info_gps.csv")
+data_sf <- st_as_sf(colony_info_gps, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+data_sf <- st_transform(data_sf, crs = 4326)
+colony_info_gps <- cbind(colony_info_gps, st_coordinates(data_sf)) %>% rename(lon = X, lat = Y)
+write_csv(colony_info_gps, "./Data/colony_info_gps.csv")
+
+library(suncalc)
+
+getMoonTimes(date = as.Date("2006-02-02"), 
+   keep = c("rise", "set"), 
+   lat = 28.4, lon = -101, tz = "UTC")
+
+moonrise = count.df %>% ungroup() %>% select(cluster_ID, local_date, date, time) %>% 
+  mutate(time = sprintf("%06d", time)) %>% 
+  mutate(scan_datetime_utc = paste(date, time)) %>% 
+  left_join(colony_info_gps[c("cluster_ID", "lon", "lat")], multiple = "first")
+
+moonrise$scan_datetime_utc <- as.POSIXct(moonrise$scan_datetime_utc, format = "%Y%m%d %H%M%S", tz = "UTC")
+
+moonrise = moonrise %>% 
+  rowwise() %>%  # Process each row independently
+  mutate(moonrise_utc = getMoonTimes(date = local_date+1, lat = lat, lon = lon, tz = "UTC", keep = c("rise", "set"))[4]) %>% 
+  ungroup() %>%
+  mutate(moonrise_utc = moonrise_utc$rise)  # or as.POSIXct if necessary
+
+moonrise = moonrise %>% 
+  mutate(from_moonrise = scan_datetime_utc - moonrise_utc)
+write_csv(moonrise, "./Data/env/moonrise.csv")
+```
+
+# Load data
+```{r combine count with env data}
+count.df = read_csv("./Data/8.5_count.df_from2006.csv") %>% 
+  group_by(track_id) %>% 
+  mutate(final.length = n_distinct(from_sunset)) %>% 
+  mutate(time = sprintf("%06d", time))
+
+expanded_roost_env = read_csv("./Data/9.5_expanded_roost_env.csv") %>% 
+  filter(cluster_ID %in% count.df$cluster_ID) %>% 
+  group_by(cluster_ID) %>% 
+  arrange(local_date) %>%  # Ensure data is sorted by date
+  mutate(prate.night_prev_day = lag(prate.night, n = 1)) %>% # 1-day lag for daily precipitation
+  mutate(air.2m.night.diff = air.2m.night - lag(air.2m.night, n = 1)) %>% # night temp change compared to the previous day
+  ungroup()
+
+drought_index = read.csv("./Data/env/drought_index.csv") %>% 
+  mutate(Date = as.Date(Date)) %>% 
+  filter(year %in% count.df$year) %>% 
+  select(-Source, -drought_index) %>% 
+  unique()
+
+#-------------------------------------------------
+combined_df <- count.df %>% 
+  left_join(moonrise %>% select(-lon, -lat, -scan_datetime_utc, -moonrise_utc), multiple = "first") %>% 
+  left_join(expanded_roost_env, by = c("local_date", "cluster_ID")) %>% 
+  left_join(drought_index[c("year", "month", "avg_drought_index")], multiple = "first") %>% 
+  group_by(cluster_ID) %>% 
+  arrange(local_date) %>% 
+  mutate(prev_day_tot_bats = lag(colony_day_count, 1)) %>% # Previous day's bat emergence count
+  ungroup()
+
+write_csv(combined_df, "./Data/10_count_env_df.csv")
+```
+
+```{r}
+combined_df = read_csv("./Data/10_count_env_df.csv")
+
+length(unique(combined_df$cluster_ID))
+length(unique(combined_df$track_id))
+```
+
+# PCA
+```{r check linear correlation}
+## remember this is only to look at collinearity (linear correlation) but not a smooth correlationship (concurvity)
+
+# variables <- expanded_roost_env %>%
+#   select(-c(local_date, cluster_ID)) %>%
+#   select_if(is.numeric)
+
+variables <- combined_df[,52:74]
+
+# cor.mat <- variables %>% cor_mat(method = "pearson")
+# cor.mat %>% cor_get_pval() 
+# 
+# ggcorrplot(cor.mat, 
+#            hc.order = FALSE, 
+#            type = "lower",
+#            #lab = TRUE,
+#            digits = 3,
+#            colors = c("#6D9EC1","white","#E46726"))
+
+library(corrplot)
+cor_matrix <- cor(variables, use = "complete.obs")
+corrplot(cor_matrix, method = "color", tl.cex = 0.7)
+
+# Cluster Correlated Features (Variable Clustering)
+library(Hmisc)
+cluster <- varclus(as.matrix(variables), similarity = "spearman")
+plot(cluster)
+
+
+# Remove highly correlated features (correlation > 0.8)
+# library(caret)
+# highly_correlated <- findCorrelation(cor_matrix, cutoff = 0.8)
+# filtered_vars <- names(variables)[-highly_correlated]
+# bat_data_filtered <- combined_df %>%
+#   select(c("adjusted_VIC", "peak_time", filtered_vars))
+```
+
+apply Principal Component Analysis (PCA) to correlated variables
+
+```{r}
+# "prate.night", "prate.daily"
+# "tcdc.night", "tcdc.daily"
+# "rhum.2m.night", "rhum.2m.daily"
+# "pres.sfc.night", "pres.sfc.daily"
+# "air.2m.night", "air.2m.daily", "air.sfc.night", "air.sfc.daily"
+# "uwind.10m.night", "uwind.10m.daily"
+# "vwind.10m.night", "vwind.10m.daily"
+
+pca_result_list = list()
+
+# Step 1: Extract the correlated variables
+correlated_vars <- combined_df[, c("vwind.10m.night", "vwind.10m.daily")]
+
+# Step 2: Standardize the data (optional if scale. = TRUE in prcomp)
+correlated_vars_scaled <- scale(correlated_vars)
+
+# Step 3: Perform PCA
+pca_result <- prcomp(correlated_vars_scaled, scale. = TRUE)
+
+# Step 4: View PCA summary
+summary(pca_result)  # To see the proportion of variance explained by each component
+
+# Step 5: Get the transformed (uncorrelated) principal components
+pca_transformed <- as.data.frame(pca_result$x)
+colnames(pca_transformed) <- paste0("vwind.10m_", colnames(pca_transformed))
+combined_df = cbind(combined_df, pca_transformed)
+combined_df <- combined_df[, !(names(combined_df) %in% c("vwind.10m.night", "vwind.10m.daily"))]
+
+
+# Optionally, view the loadings (the relationship between original variables and components)
+pca_result$rotation
+pca_result_list[[7]] = pca_result
+saveRDS(pca_result_list, "./Data/pca_result_list.rds")
+```
+
+
+# Random Forest Model
+
+```{r run RFmodel}
+# Random Forest
+# Load necessary libraries
+library(randomForest)
+library(dplyr)
+library(pdp)
+library(ggplot2)
+library(gridExtra)
+library(tictoc)
+library(caret) 
+library(tidyr)
+```
+
+## Split the data into training and testing
+
+```{r}
+# Randomly sample 70% of the unique dates
+train_dates <- sample(unique(combined_df$local_date), size = 0.7 * length(unique(combined_df$local_date)))
+
+# Create training and testing datasets based on the sampled dates
+train_df <- combined_df %>% filter(local_date %in% train_dates)
+test_df <- combined_df %>% filter(!local_date %in% train_dates)
+```
+
+
+## Regularized Random Forest (RRF) for Feature Selection
+```{r}
+library(RRF)
+
+formula <- adjusted_VIC ~ lunar.illumination + air.2m.night + air.sfc.night + 
+            prate.night + pres.sfc.night + rhum.2m.night + tcdc.night + 
+            uwind.10m.night + vis.night + vwind.10m.night + air.2m.daily + 
+            air.sfc.daily + prate.daily + pres.sfc.daily + rhum.2m.daily + 
+            tcdc.daily + uwind.10m.daily + vis.daily + vwind.10m.daily + 
+            prate.night_prev_day + air.2m.night.diff + avg_drought_index + 
+            prev_day_tot_bats + avg_drought_index + from_sunset + from_moonrise + 
+            yday + lon + lat + roost_type + dist
+
+# Fit a Regularized Random Forest (RRF)
+# gamma = 0 means no regularization, higher values penalize correlated variables more
+rrf_model <- RRF(formula, data = train_df, flagReg = 1, importance = TRUE, gamma = 0.5, na.action = na.omit)
+
+# View variable importance
+varImpPlot(rrf_model)
+
+formula <- adjusted_VIC ~ lunar.illumination + air.sfc.night + 
+            prate.night + vwind.10m.night + pres.sfc.daily + rhum.2m.daily + 
+            tcdc.daily + uwind.10m.daily + vis.daily + 
+            prate.night_prev_day + air.2m.night.diff + avg_drought_index +
+            from_sunset + from_moonrise + 
+            yday + lon + lat + roost_type + dist
+
+tic()
+
+rf_model <- randomForest(formula, data = train_df, importance=TRUE, na.action = na.omit)
+
+toc()
+
+library(pushoverr)
+set_pushover_user(user = "ufgsif4kshufxw7u1uzruxu6h5c1u7")
+set_pushover_app(token = "air46ko6k7gpqenf7qyr1jwq8zbf9a")
+pushover(message = "RF model is finished!")
+```
+
+## RF model
+ 
+```{r}
+# Define the formula
+vars <- paste(names(combined_df[, 52:74]), collapse = " + ")
+vars <- paste0(c(names(combined_df[, 52:61])[-3], names(combined_df[, 71:74])), collapse = " + ")
+vars <- paste0(c(names(combined_df[, 52]), names(combined_df[, 62:74][-2])), collapse = " + ")
+additional_vars <- "avg_drought_index + from_sunset + from_moonrise + yday + lon + lat + roost_type + dist"
+formula_string <- paste("adjusted_VIC ~", vars, "+", additional_vars)
+formula <- as.formula(formula_string)
+
+# tune_grid <- expand.grid(mtry = c(5, 8, 10, 12))
+# 
+# control <- trainControl(method = "cv", number = 5)  # 5-fold cross-validation
+
+# Fit the random forest model
+tic()
+
+rf_model <- randomForest(formula, data = train_df, importance=TRUE, na.action = na.omit)
+
+# rf_tuned <- train(formula, data = train_df, method = "rf", trControl = control, tuneGrid = tune_grid, ntree = 1000, na.action = na.omit)
+
+toc()
+
+# library(pushoverr)
+# set_pushover_user(user = "ufgsif4kshufxw7u1uzruxu6h5c1u7")
+# set_pushover_app(token = "air46ko6k7gpqenf7qyr1jwq8zbf9a")
+# pushover(message = "RF model is finished!")
+
+saveRDS (rf_model, "./Data/rf_model.6")
+
+print(rf_model)
+varImpPlot(rf_model)
+#plot(rf_model)
+```
+
+## Visualize variable importance
+
+```{r}
+# Get variable importance from the model fit
+varImpPlot(rf_model)
+
+importance(rf_model, type = 1)  # %IncMSE is Type 1
+
+var_importance <- as.data.frame(importance(rf_model))
+var_importance$Variable = rownames(var_importance)
+var_importance$Variable = c(
+  "Lunar Illumination", "Night Surface Air Temperature", "Night Precipitation", "Night Northward Wind (10m)", 
+  "Daily Surface Pressure", "Daily Relative Humidity (2m)", "Daily Total Cloud Cover", 
+  "Daily Eastward Wind (10m)", "Daily Visibility", "Previous Night Precipitation", 
+  "Night Air Temperature Difference (2m)", "Average Monthly Drought Index", "Previous Day Bat Emergence Count", 
+  "Time Since Sunset", "Time Since Moonrise", "Day of Year", "Longitude", "Latitude", 
+  "Roost Type", "Distance to Radar"
+)
+names(var_importance)[1] = "IncMSE"
+
+
+
+ggplot(var_importance, aes(x=Variable, y=IncMSE)) +
+  geom_segment(aes(x=Variable, xend=Variable, y=0, yend=IncMSE), linewidth = 2, color="skyblue") +
+  geom_point(aes(size = IncNodePurity), color="blue", alpha=0.8) +
+  scale_size(range = c(2, 9))+
+  theme_minimal()+
+  coord_flip() +
+  theme(
+    legend.position="bottom",
+    panel.grid.major.y = element_blank(),
+    panel.border = element_blank(),
+    axis.ticks.y = element_blank()
+  )+
+  labs(x = "Variable names", y = "% Increase in Mean Squared Error", size = "Increase in Node Purity")
+
+#ggsave("./Plots/RF_VarImp.pdf", width = 12, height = 4, bg="transparent")
+
+
+# Plot for %IncMSE
+plot_incMSE <- ggplot(var_importance, aes(x = reorder(Variable, IncMSE), y = IncMSE)) +
+  geom_bar(stat = "identity", fill = "skyblue") +
+  coord_flip() +
+  labs(x = "Variables", y = "% Mean Decrease in Accuracy", tag = "B") +
+  theme_minimal()
+
+# Plot for IncNodePurity
+plot_node_purity <- ggplot(var_importance, aes(x = reorder(Variable, IncNodePurity), y = IncNodePurity)) +
+  geom_bar(stat = "identity", fill = "salmon") +
+  coord_flip() +
+  labs(x = "Variables", y = "Mean Decrease in Node Impurity", tag = "C") +
+  theme_minimal()+
+  scale_y_continuous(labels = scales::scientific)
+```
+
+## Evaluate the model on the testing dataset
+
+```{r}
+# Make predictions on the testing data
+test_df_pred = test_df %>% 
+  mutate(pred = predict(rf_model, newdata = test_df)) %>% 
+  drop_na(pred) %>% 
+  mutate(residuals = adjusted_VIC - pred)
+
+mean((test_df_pred$pred - test_df_pred$adjusted_VIC)^2) #MSE
+R2(test_df_pred$pred, test_df_pred$adjusted_VIC)
+
+# Scatter Plot -- Visualize Predictions vs Actual Values
+options(scipen = 999)
+pred_plot = ggplot(data = test_df_pred, aes(x = adjusted_VIC, y = pred)) +
+  geom_point(color = "grey", alpha = 0.8) +
+  geom_smooth(method = "lm", color = "black")+
+  geom_abline(intercept = 0, slope = 1, color = "red", linetype = "dashed") +
+  labs(x = "Actual emergence count",
+       y = "Predicted emergence count",
+       tag = "A") +
+  theme_minimal()
+#summary(lm(pred ~ adjusted_VIC, data = test_df_pred))
+
+# Residual Plot: To check for any patterns in the residuals (the difference between actual and predicted values)
+ggplot(data = test_df_pred, aes(x = pred, y = residuals)) +
+  geom_point(color = "darkgreen", alpha = 0.7) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  labs(title = "Residuals vs Predicted Values",
+       x = "Predicted Adjusted VIC",
+       y = "Residuals") +
+  theme_minimal()
+
+png("./Chap4_Plots/Fig 2.png", width = 15, height = 6, res = 300, units = "in")
+grid.arrange(pred_plot, plot_incMSE, plot_node_purity, ncol = 3)
+dev.off()
+```
+
+
+# GAM Model 
+
+```{r all variables}
+bam1 <- bam(log(adjusted_VIC) ~ s(lunar.illumination) + s(air.sfc.night) + s(prate.night) + s(pres.sfc.night) +  s(rhum.2m.night) + s(tcdc.night) + s(uwind.10m.night) + s(vwind.10m.night) + s(vis.night) + s(air.sfc.daily) + s(prate.daily) + s(pres.sfc.daily) + s(rhum.2m.daily) + s(tcdc.daily) + s(uwind.10m.daily) + s(vis.daily) + s(vwind.10m.daily) + s(avg_drought_index) + s(from_sunset) + s(from_moonrise) + s(yday) + s(lon, lat) + roost_type + s(dist) + s(prate.night_prev_day) + s(air.2m.night.diff) + s(prev_day_tot_bats), discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+
+summary(bam1) # Deviance explained = 66.6%
+
+s1 = getViz(bam1)
+
+print(plot(s1, allTerms = T, seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+plot(bam1, trans = function(x){exp(coef(bam1)[1] + x)}, pages = 1)
+
+coef(bam1)[1]
+concurvity(bam1, full=T)
+concurvity(bam1, full=F)
+
+par(mfrow = c(2, 2))  
+gam.check(bam1)
+```
+
+```{r only daily variables}
+bam2 <- bam(log(adjusted_VIC) ~ s(lunar.illumination) + s(air.sfc.daily) + s(prate.daily) + s(pres.sfc.daily) + s(rhum.2m.daily) + s(tcdc.daily) + s(uwind.10m.daily) + s(vis.daily) + s(vwind.10m.daily) + s(avg_drought_index) + s(from_sunset) + s(from_moonrise) + s(yday) + s(lon, lat) + roost_type + s(dist) + s(prate.night_prev_day) + s(air.2m.night.diff) + s(prev_day_tot_bats), discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+
+summary(bam2) # Deviance explained = 66.2%
+
+s2 = getViz(bam2)
+
+print(plot(s2, allTerms = T, seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+
+concurvity(bam2, full=T)
+```
+
+```{r random forest variables}
+bam3 <- bam(log(adjusted_VIC) ~ s(lunar.illumination) + s(air.2m.daily) + s(prate.night) + s(pres.sfc.daily) +  s(rhum.2m.daily) + s(tcdc.daily) + s(uwind.10m.daily) + s(vwind.10m.night) + s(vis.daily) + s(avg_drought_index) + s(from_sunset) + s(from_moonrise) + s(yday) + s(lon, lat) + roost_type + s(dist) + s(prate.night_prev_day) + s(air.2m.night.diff) + s(prev_day_tot_bats), discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+
+summary(bam3) # Deviance explained =  66.4%
+
+s3 = getViz(bam3)
+
+print(plot(s3, trans = function(x){exp(coef(bam3)[1] + x)}, allTerms = T, seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+
+concurvity(bam3, full=F)
+```
+
+```{r}
+# remove s(lunar.illumination) due to high concurvity with s(from_moonrise) - 0.95
+# remove s(prate.night) due to high concervity with s(prate.night_prev_day) - 0.94
+# remove s(vis.daily) due to high concervity with s(prate.night_prev_day) - 0.91
+
+bam4 <- bam(log(adjusted_VIC) ~ s(air.2m.daily) + s(pres.sfc.daily) + s(rhum.2m.daily) + s(tcdc.daily) + s(uwind.10m.daily) + s(vwind.10m.night) + + s(avg_drought_index) + s(from_sunset) + s(from_moonrise) + s(yday) + s(lon, lat) + roost_type + s(dist) + s(prate.night_prev_day) + s(air.2m.night.diff) + s(prev_day_tot_bats), discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+
+summary(bam4) # Deviance explained = 66.4%
+
+s4 = getViz(bam4)
+
+print(plot(s4, trans = function(x){exp(coef(bam4)[1] + x)}, allTerms = T, seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+
+concurvity(bam4, full=T)
+concurvity(bam4, full=F)
+```
+
+```{r}
+# remove s(dist) due to high concurvity with s(lon, lat)
+bam5 <- bam(log(adjusted_VIC) ~ s(air.2m.daily) + s(pres.sfc.daily) + s(rhum.2m.daily) + s(tcdc.daily) + s(uwind.10m.daily) + s(vwind.10m.night) + + s(avg_drought_index) + s(from_sunset) + s(from_moonrise) + s(yday) + s(lon, lat) + roost_type + s(prate.night_prev_day) + s(air.2m.night.diff) + s(prev_day_tot_bats), discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+
+summary(bam5) # Deviance explained = 66.2%
+
+s5 = getViz(bam5)
+
+print(plot(s5, trans = function(x){exp(coef(bam5)[1] + x)}, allTerms = T,  seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+
+plot(bam5, trans = function(x){exp(coef(bam5)[1] + x)}, pages = 1)
+
+concurvity(bam5, full=T)
+concurvity(bam5, full=F)
+```
+
+```{r}
+# remove s(prev_day_tot_bats)
+bam6 <- bam(log(adjusted_VIC) ~ s(air.2m.daily) + s(pres.sfc.daily) + s(rhum.2m.daily) + s(tcdc.daily) + s(uwind.10m.daily) + s(vwind.10m.night) + + s(avg_drought_index) + s(from_sunset) + s(from_moonrise) + s(yday) + s(lon, lat, k = 25) + roost_type + s(prate.night_prev_day) + s(air.2m.night.diff), discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+
+summary(bam6) # Deviance explained = 45.2%
+
+s6 = getViz(bam6)
+
+print(plot(s6, allTerms = T, trans = function(x){exp(coef(bam6)[1] + x)}, seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+
+concurvity(bam6, full=T)
+concurvity(bam6, full=F)
+```
+
+```{r}
+# s(lon) + s(lat) + ti(lon, lat)
+# bam7 <- bam(log(adjusted_VIC) ~ s(lunar.illumination) + s(air.sfc.night) + s(prate.night) +  s(rhum.2m.night) + s(tcdc.night) + s(uwind.10m.night) + s(vwind.10m.night) + s(avg_drought_index) + s(from_sunset) + s(yday) + s(lon) + s(lat) + ti(lon, lat) + roost_type, discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+# 
+# summary(bam7) # Deviance explained = 44%
+# 
+# s7 = getViz(bam7)
+# 
+# print(plot(s7, allTerms = T, seWithMean = TRUE), pages = 1) # Calls print.plotGam()
+# 
+# concurvity(bam7, full=F)
+```
+
+```{r}
+# bam8 <- bam(log(adjusted_VIC) ~ s(lunar.illumination) + s(air.sfc.night) +  s(rhum.2m.night) + s(tcdc.night) + s(uwind.10m.night) + s(vwind.10m.night) + s(avg_drought_index, k=5) + s(from_sunset) + s(yday) + s(lon, lat, k = 20) + roost_type, discrete=TRUE, select=TRUE, nthreads=1, method = 'fREML', data = combined_df)
+# 
+# summary(bam8)
+# 
+# s8 = getViz(bam8)
+# 
+# plot(sm(s8,7),trans = function(x){exp(coef(bam6)[1] + x)}, seWithMean = TRUE)+
+#     l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("E")+ dark_theme_classic()+
+#      xlab("Palmer dought index") + ylab("count")+theme(plot.title = element_text(face = "bold"))+ scale_y_continuous(limits=c(0, 40000))
+```
+
+```{r model.selection}
+# model.sel(bam3, bam4, bam5, bam6, rank=AIC) # 1 > 4 > 2 > 5 > 7 > 6 > 3
+
+pdf("./Plots/bam6.output.latlong_dark.pdf", width = 9, height = 6)
+plot(sm(s6,10), seWithMean = TRUE)+
+    l_fitRaster() + l_fitContour()+ l_rug(alpha = 0.4) + ggtitle("Bats landscape distribution")+
+    scale_fill_viridis(option="viridis")+
+    #guides(fill=guide_colorbar(title="count"))+
+  dark_theme_classic()+
+    xlab("Longitude") + ylab("Latitude")+theme(plot.title = element_text(face = "bold"))
+dev.off()
+
+vis.gam(bam6, view = c("lat", "lon"),
+    theta = 50, n.grid = 50, lwd = 0.4)
+
+plot(bam6, page = 1, scheme = 2)
+
+pdf("./Plots/bam6.output.pdf", width = 15, height = 9)
+print(plot(s6, trans = function(x){exp(coef(bam6)[1]+x)}, allTerms = T, seWithMean = TRUE), pages = 1)
+dev.off()
+
+par(mfrow = c(2, 2))
+gam.check(bam6)
+
+ggplot(combined_df, aes(x = lon, y = lat, fill = adjusted_VIC)) +
+  geom_tile() +
+  scale_fill_viridis() +
+  labs(title = "Heat Map of box_sum_bat", x = "Longitude", y = "Latitude", fill = "box_sum_bat") +
+  theme_minimal()
+
+ggplot(combined_df, aes(x=roost_type, y=adjusted_VIC)) + 
+  geom_boxplot()
+
+ggplot(combined_df, aes(x=dist, y=adjusted_VIC)) + 
+  geom_point(alpha=0.4)+
+  geom_smooth()
+```
+
+# Make GAM output plot
+
+```{r}
+library(itsadug)
+
+roost_levels <- unique(bam5$model$roost_type)
+coefs <- as.data.frame(get_coefs(bam5, se = TRUE))
+coefs$roost_type = roost_levels
+colnames(coefs)[2] = "se"
+
+
+# Adjust the coefficient estimates by adding the intercept
+intercept <- coefs[1, "Estimate"]
+coefs$Estimate <- coefs$Estimate + intercept
+coefs[1, "Estimate"] = intercept
+coefs$perc = exp(coefs$Estimate)/sum(exp(coefs$Estimate))
+coefs$Estimate_exp = exp(coefs$Estimate)
+coefs$se_exp = exp(coefs$Estimate - 1.96 * coefs$se)
+
+p15 = ggplot(coefs, aes(x = roost_type, y = exp(Estimate))) +
+  geom_boxplot() +
+  geom_errorbar(aes(ymin = exp(Estimate - 1.96 * se),
+                    ymax = exp(Estimate + 1.96 * se)),
+                width = 0.2) +
+  ggtitle("N") +
+  xlab("Roost type") +
+  ylab("Count") +
+  theme_classic() +
+  theme(plot.title = element_text(face = "bold"))
+
+exp(coefs$Estimate)
+```
+
+```{r}
+s = s5
+bam = bam5
+
+  p1<-plot(sm(s,1),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine() + l_rug(alpha = 0.4) + ggtitle("A")+  
+    xlab("Air temperature (K)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p2<-plot(sm(s,2),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine() + l_rug(alpha = 0.4) + ggtitle("B")+  
+    xlab("Surface pressure") + ylab("count")+
+    theme(plot.title = element_text(face = "bold")) 
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p3<-plot(sm(s,3),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("C")+  
+    xlab("Relative humidity (%)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold")) 
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p4<-plot(sm(s,4),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("D")+  
+    xlab("Total cloud cover (%)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold")) 
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p5<-plot(sm(s,5),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("E")+  
+    xlab("Eastward wind speed (m/s)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p6<-plot(sm(s,6),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("F")+  
+    xlab("Northward wind speed (m/s)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p7<-plot(sm(s,7),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("I")+  
+     xlab("Palmer dought index") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p8<-plot(sm(s,8),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("J")+  
+    xlab("Time from sunset (mins)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p9<-plot(sm(s,9),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("K")+  
+    xlab("Time from moonrise (seconds)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p10<-plot(sm(s,10),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("L")+  
+    xlab("Day of year") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p12<-plot(sm(s,12),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("G")+  
+    xlab("Previous night precipitation") + ylab("count")+
+    theme(plot.title = element_text(face = "bold")) 
+    #scale_y_continuous(limits=c(0,  600000))
+    
+  p13<-plot(sm(s,13),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("H")+  
+    xlab("Night air temperature differences (k)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold")) 
+    #scale_y_continuous(limits=c(0,  600000))
+  
+  p14<-plot(sm(s,14),trans = function(x){exp(coef(bam)[1] + x)}, seWithMean = TRUE)+
+    l_fitLine() + l_ciLine()+ l_rug(alpha = 0.4) + ggtitle("M")+  
+    xlab("Previous day bat emergence count (millions)") + ylab("count")+
+    theme(plot.title = element_text(face = "bold"))+ 
+    scale_x_continuous(limits=c(0,  4000000), labels = unit_format(unit = "", scale = 1e-6))
+  
+  p11 = plot(sm(s,11), seWithMean = TRUE)+
+    l_fitRaster() + l_fitContour() + l_rug(alpha = 0.4)+
+    scale_fill_viridis(option="viridis")+
+    guides(fill="none")+
+    xlab("Longitude") + ylab("Latitude") + theme(plot.title = element_text(face = "bold")) + ggtitle("O")
+  
+  pdf("./Plots/bam5.output.pdf", width = 15, height = 10) # Open a new pdf file
+  png("./Chap4_Plots/Fig 3.png", width = 20, height = 11, res = 600, units = "in")
+  gridPrint(p1, p2, p3, p4, p5, p6, p12, p13, p7, p8, p9, p10, p14, p15, p11, ncol=5) # Write the grid.arrange in the file
+  dev.off()
+```
+

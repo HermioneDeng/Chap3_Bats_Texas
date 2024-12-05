@@ -1,0 +1,2031 @@
+---
+title: "4_Analysis"
+author: "Yuting Deng"
+date: "2024-07-19"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+invisible(lapply(c("anytime", "lubridate", "dplyr", "purrr", "broom", "ggplot2", "scales", "tidyr", "viridis", "ggstats", "terra", "sf", "lme4", "lmerTest", "mgcv", "pracma", "scam", "phenomix", "TMB", "ggspatial", "ggmap", "tidyverse", "gganimate", "ggdark", "fs", "SciViews", "gridExtra", "brms", "forecast", "zoo", "boot", "ggridges", "report", "tigris"), library, character.only = TRUE, quietly = T))
+```
+
+# Preparation 
+
+## Prepare Data
+
+```{r}
+sweep_path = "./Data/counts_40dBZ/sweeps/"
+track_path = "./Data/counts_40dBZ/tracks/"
+sweep.df = data.frame()
+track.df = data.frame()
+
+# combine all screening files and filter based on notes
+
+# combine all sweep files
+for (i in 1:length(dir_ls(sweep_path))){
+  file = read.csv(dir_ls(sweep_path)[i]) 
+  if (nrow(file) == 0){next}
+  else{
+    table = file %>% 
+      mutate(filename_det_idx = paste0(filename, "_", str_sub(track_id, start= 14)))
+    sweep.df = rbind(sweep.df, table)}
+}
+
+sweep.df = sweep.df %>% filter(sweep_angle>0) %>% filter(sweep_idx != 1 & sweep_idx != 3)
+
+write.csv(sweep.df, "./Data/7.5_counts_40dBZ_sweeps_good.csv", row.names = F)
+
+# combine all track files
+for (i in 1:length(dir_ls(track_path))){
+  file = read.csv(dir_ls(track_path)[i]) 
+  if (nrow(file) == 0){next}
+  else{
+    table = file %>% 
+      mutate(filename_det_idx = paste0(filename, "_", track_id))
+    track.df = rbind(track.df, table)}
+}
+
+write.csv(track.df, "./Data/7.5_counts_40dBZ_tracks.csv", row.names = F)
+```
+
+```{r Prepare data}
+df = read.csv("./Data/8_all_detections_w_counts copy.csv") %>% 
+  filter(box_sum_bats<6000000) %>% 
+  mutate(local_date = anytime::anydate(local_date),
+         month = month(local_date),
+         year = year(local_date),
+         cluster_ID = as.character(cluster_ID))
+
+# Data availability is different across years
+df %>% group_by(year) %>% summarize(count = n_distinct(track_id))
+
+count.df = df %>% group_by(cluster_ID) %>% filter(n_distinct(year) >= 5) # Filter for cluster_IDs with at least 5 years of data
+
+# geo_dist in the track files are the right distance from radar
+count.df = left_join(count.df, track.df[c("filename_det_idx", "geo_dist")], by = "filename_det_idx", multiple = "first")
+
+# add in colony info
+colony_df = read.csv ("./Data/colony_info.csv") %>% mutate (cluster_ID = as.character(cluster_ID))
+count.df <- left_join(count.df %>% select(-notes), colony_df, by = "cluster_ID")
+```
+
+### recalculate the height bins and summarize across them
+```{r}
+range(sweep.df$sweep_angle)
+
+## Resample the real angles
+  sweep.df <- sweep.df %>%  
+    mutate(angle_bins = cut(sweep_angle, breaks = seq(0, 20, 1), 
+                            include.lowest = TRUE)) 
+  
+  sweep.df = sweep.df %>% 
+    # Create groups of angle bins for each detection_id:
+    group_by(filename_det_idx, angle_bins) %>% 
+    # Compute mean number of birds in each group:
+    mutate(mean_bat_count = mean(n_animals)) %>%
+    # Keep only the rows that have different detection_id within each group:
+    distinct(filename_det_idx, .keep_all = TRUE)
+
+## Get the number of birds per detection (summarizing the height distribution)--
+  detections_df = sweep.df %>% 
+    group_by(filename_det_idx) %>%
+    mutate(box_sum_bats = sum(n_animals),
+      box_sum_bats2 = sum(mean_bat_count)) 
+  
+  ggplot(detections_df, aes(x=box_sum_bats, y = box_sum_bats2))+
+    geom_point()+
+    geom_smooth(method = "lm")
+```
+
+## Range Correction
+
+### beam geometry
+
+```{r}
+# Beam height in meters at 150 km range for a 0.5 degree elevation beam:
+beam_height(37144.55, 6.1, k = 4/3, lat = 35, re = 6378, rp = 6357)
+beam_width(37144.55, 1)
+
+# Plot the beam height of the 0.5 degree elevation beam:
+range <- seq(0, 150000, 100)
+beam.df = data.frame()
+for (i in seq(0.5, 14.5, 0.5)){
+  beam = data.frame(range = range, 
+                    beam.height = beam_height(range, i), 
+                    beam.width = beam_width(range, 1), 
+                    sweep_angle = i)
+  beam.df = rbind(beam.df, beam)
+}
+beam.df$sweep_angle = as.factor(beam.df$sweep_angle)
+beam.df <- beam.df %>% mutate(beam_lower = `beam.height` - 0.5 * `beam.width`,
+                              beam_upper = `beam.height` + 0.5 * `beam.width`)
+
+
+# plot the beam geometry
+ggplot(beam.df , 
+       aes(x = range/1000, y = beam.height, group = sweep_angle, color = sweep_angle)) +
+  geom_ribbon(aes(ymin = beam_lower, ymax = beam_upper), alpha = 0.2) +
+  geom_line(size = 1) +
+  scale_y_continuous(n.breaks = 12, limits = c(0, 5000))+
+  scale_x_continuous(n.breaks = 10, limits = c(0, 150))+
+  labs(title = "Relationship between Range and Beam Height",
+       x = "Range (km)",
+       y = "Beam Height (m)") +
+  theme_minimal()
+
+# Plot the beam profile, for a 2 degree elevation beam at 50 km distance
+# from the radar:
+plot(beam_profile(height = 0:5000, 150000, 0.5), 0:5000,
+  xlab = "normalized radiated energy",
+  ylab = "height [m]", main = "beam elevation: 0.5 deg, distance=150km"
+)
+```
+
+### calculate the volume of the voxel shaped like a truncated elliptical cone
+```{r}
+calculate_volume = function(geo_dist, station, local_date){
+  
+  # Define the input parameters
+  # Vertical beam width in degrees
+  theta_rad <- 1 * pi / 180
+  
+  # Horizontal beam width in degrees
+  phi_rad <- ifelse(
+    (station == "KEWX" & local_date < as.Date("2008-07-10")) |
+      (station == "KDFX" & local_date < as.Date("2008-07-10")) |
+      (station == "KSJT" & local_date < as.Date("2008-06-19")) |
+      (station == "KGRK" & local_date < as.Date("2008-07-08")),
+    1 * pi / 180,
+    0.5 * pi / 180
+  )
+  
+  # Distance between range gates in meters
+  range_gate_distance <- 250
+  
+  V = 2.011 * 0.35 * sqrt(2*pi) * pi * geo_dist^2 * theta_rad * phi_rad * range_gate_distance / (4 * 2 * log(2) * 10^(9)) 
+  #Based on Chilson et al. / 2*log(2) * inflated by a factor of 2.011
+  
+  return(V)
+  
+}
+
+plot(seq(0, 150000, 100)/1000, 
+     calculate_volume(geo_dist = seq(0, 150000, 100), local_date = as.Date("2008-06-01"), station = "KSJT"),
+  xlab = "Distance from radar (km)",
+  ylab = "Voxel size (cubic kilometers)")
+```
+
+
+```{r}
+sweep.df2 = left_join(sweep.df, 
+                      count.df[c("station","from_sunset","det_score","x","y","r","geo_dist","lon","lat","radius",
+                                 "local_date", "cluster_ID", "filename_det_idx", "year", "box_sum_bats")], 
+                      by = "filename_det_idx", 
+                      multiple = "first")
+
+# Remove rows that is in sweep.df but not in the count.df file
+sweep.df2 = sweep.df2[!is.na(sweep.df2$cluster_ID), ]
+
+sweep.df2 = 
+  sweep.df2 %>% mutate(beam_height = beam_height(geo_dist, sweep_angle, k = 4/3, lat = 29.98508, re = 6378, rp = 6357),
+                     beam_lower = beam_height - 0.5*beam_width(geo_dist, 1),
+                     beam_upper = beam_height + 0.5*beam_width(geo_dist, 1),
+                     voxel_volume = calculate_volume(geo_dist, station, local_date),
+                     n_animal_density = n_animals/(voxel_volume*n_roost_pixels)) #individuals/km^3
+
+# Remove rows with NA in the "n_animal_density" column
+sweep.df2 <- sweep.df2[!is.na(sweep.df2$n_animal_density), ]
+# Check if there's still any NAs
+sapply(sweep.df2, function(x) sum(is.na(x)))
+
+sweep.df2 = left_join(sweep.df2, detections_df[c("filename_det_idx", "box_sum_bats2")],
+                      by = "filename_det_idx", 
+                      multiple = "first")
+
+# sweep.df2.closeangles <- sweep.df2 %>%
+#   group_by(filename_det_idx) %>%
+#   filter(any(abs(diff(sort(sweep_angle))) < 0.25)) %>%
+#   ungroup()
+
+# Just a quick visualization to decide the range of detections to use
+ggplot(sweep.df2 %>% filter(geo_dist>10000 & geo_dist<60000))+
+  geom_smooth(aes(x = beam_height, y = n_animals))
+hist(sweep.df2 %>% filter(geo_dist>10000 & geo_dist<60000) %>% pull(geo_dist))
+```
+
+### Build verticle profiles
+
+```{r}
+# Define the overlapping function
+check_overlap <- function(range1_start, range1_end, range2_start, range2_end) {
+  # Check if the ranges overlap
+  overlap <- !(range2_end < range1_start | range2_start > range1_end)
+  
+  return(overlap)
+}
+
+# create the vertical profile with 100 m bins (from 0 - 5100 m)
+time_range = seq(-90, 140, by = 10)
+vp = list()
+
+j = 1
+vid = list()
+for(t in time_range){
+
+vp[[j]] = data.frame()
+
+
+# Only use data close to radar (10-60km)
+sweep.df3 = sweep.df2[c("geo_dist", "n_animal_density", "beam_height", "beam_lower", "beam_upper", "from_sunset")] %>%
+  filter(geo_dist>10000 & geo_dist<60000) %>%
+  filter(from_sunset> t & from_sunset< t+10)
+
+for (bin in seq(100, 5100, by = 100)){
+
+  print(bin)
+  range2_start = bin-100
+  range2_end = bin
+  num <- list()
+
+  for (i in 1:nrow(sweep.df3)){
+
+    range1_start = sweep.df3[i,]$beam_lower
+    range1_end = sweep.df3[i,]$beam_upper
+
+    if(check_overlap(range1_start, range1_end, range2_start, range2_end)){
+      num = c(num, sweep.df3[i,]$n_animal_density)
+    }
+
+  }
+  vp[[j]] = rbind(vp[[j]], data.frame(height.bin = bin,
+                              avg.animal.den = mean(unlist(num)),
+                              sd.animals.den = sd(unlist(num))))
+
+}
+  
+vid[[j]] = sum(vp[[j]]$avg.animal.den*0.1, na.rm = T) #100m = 0.1km
+j= j+1
+}
+
+saveRDS(vp, "./Data/vertical_profile_10km_60km_100m.rds")
+
+pdf("./Plots/vp_emergence.pdf", width = 5, height = 5)
+
+j = 1
+for(t in time_range){
+p = ggplot(vp[[j]], aes(x = avg.animal.den, y = height.bin-100))+
+  geom_point()+
+  geom_smooth(se=F)+
+  # geom_errorbarh(aes(xmin = avg.animal.den - sd.animals.den,
+  #                    xmax = avg.animal.den + sd.animals.den)) +
+  geom_line(orientation = "y")+
+  theme_dark()+
+  ggtitle(paste0(t, " to ", t+10, " after sunset"))
+
+  j = j+1
+  print(p)
+}
+dev.off()
+
+plot(x = time_range, y = unlist(vid))
+```
+
+### Adjust vertically integrated count based on Kranstauber et al. equations
+
+```{r}
+# Height bin in m, density in individual/km^3
+height_bins <- seq(0, 5000, by = 100)
+
+adjust.result = data.frame(matrix(ncol = 6, nrow = length(unique(sweep.df2$filename_det_idx))))
+names(adjust.result3) = c("filename_det_idx", "box_sum_bats2", "adjust_ratio", "adjust_ratio_ori", "area_xyr", "adjusted_VIC2")
+
+# Initialize a row index
+row_index <- 1
+
+for (k in unique(sweep.df2$filename_det_idx)){
+  
+example = sweep.df2 %>% filter(filename_det_idx == k) %>% filter(sweep_idx != 1 & sweep_idx != 3)
+
+# time after sunset determins the range_index (which vp to use)
+time = as.integer(example$from_sunset[1])
+range_index <- which(time_range <= time & time < (time_range + 10))
+overlapping_bins = c()
+
+for (i in 1:nrow(example)){
+  #antenna pattern
+  #b[i] = beam_profile(example[i,]$beam_height, example[i,]$geo_dist, example[i,]$sweep_angle)
+  
+  # which part of the vp this beam overlaps, this determines which part of vp to intergral 
+  range1_start = example[i,]$beam_lower 
+  range1_end <- example[i,]$beam_upper
+  # Identify the overlapping bins
+  overlapping_bins[[i]] <- which(height_bins <= range1_end & (height_bins + 100) >= range1_start)
+}
+
+# there are overlapped area between beams, so we find the total covered beam area
+total_overlapped_bins = unlist(overlapping_bins) %>% unique()
+  
+expected = sum(vp[[range_index]][total_overlapped_bins,"avg.animal.den"]*0.1, na.rm = T)
+
+################################
+# observed.vp = data.frame(
+#   bin_num = 1:51,
+#   height.bin = seq(100, 5100, by = 100),
+#   avg.animal.den = NA
+# )
+# 
+# values <- lapply(1:nrow(example), function(i) {
+#   list(
+#     value = example[i,]$n_animal_density,  # Extract the n_animal_density for this row
+#     bins = overlapping_bins[[i]]           # Extract the corresponding bins
+#   )
+# })
+# 
+# # Create a list to store all values for each bin_num
+# bin_values <- vector("list", length(observed.vp$bin_num))
+# 
+# # Loop over each value and its corresponding bins
+# for (val in values) {
+#   value <- val$value
+#   bins <- val$bins
+# 
+#   # Append the value to the corresponding bin_num's list
+#   for (bin in bins) {
+#     bin_values[[bin]] <- c(bin_values[[bin]], value)
+#   }
+# }
+# 
+# # Now, calculate the average for each bin after the loop
+# for (i in seq_along(bin_values)) {
+#   if (length(bin_values[[i]]) > 0) {
+#     observed.vp$avg.animal.den[i] <- mean(bin_values[[i]])
+#   }
+# }
+# 
+# observed = sum((observed.vp$avg.animal.den)*0.1, na.rm = T)
+
+#############################################
+# adjust Ratio
+R = expected/vid[[range_index]]
+R = ifelse(R < 0.1, 0.1, R)
+
+#VID_a = observed/R
+
+  adjust.result$filename_det_idx[row_index] <- k
+  adjust.result$box_sum_bats2[row_index] <- example$box_sum_bats2[1]
+  adjust.result$adjust_ratio[row_index] <- R
+  adjust.result$adjust_ratio_ori[row_index] <- expected / vid[[range_index]]
+  adjust.result$area_xyr[row_index] <- (2 * example$r[1] * 0.5)^2
+  adjust.result$adjusted_VIC2[row_index] <- adjust.result$box_sum_bats2[row_index] / adjust.result$adjust_ratio[row_index]
+  
+row_index <- row_index + 1
+}
+
+sweep.df4 <- sweep.df2 %>% left_join(adjust.result, by = c("filename_det_idx", "box_sum_bats2"), multiple = "first") 
+#%>% filter(!is.na(adjusted_VIC))
+
+sapply(sweep.df4, function(x) sum(is.na(x)))
+#NA.df = sweep.df4[is.na(sweep.df4$adjusted_VIC2), ]
+
+write_csv(sweep.df4, "./Data/7.6_range_corrected_VIC.csv")
+```
+
+```{r}
+sweep.df4_first <- sweep.df4 %>%
+  group_by(filename_det_idx) %>%
+  slice(1) %>%
+  ungroup()
+
+ggplot(sweep.df4_first[c("geo_dist", "adjust_ratio")] %>% unique(), aes(x = geo_dist/1000, y = adjust_ratio))+
+  geom_point()+
+  geom_smooth()+
+  labs(x = "distance from radar (km)", y = "adjust ratio")
+ggsave("./Plots/adjust_ratio_by_distance.pdf", width = 8, height = 6)
+
+# Look at the corrected count
+hist(unique(sweep.df4_first %>% filter(adjusted_VIC2<1000000) %>% pull(adjusted_VIC2)))
+quantile(sweep.df4_first$adjusted_VIC2)
+
+ggplot(sweep.df4_first, aes(x = geo_dist, y = adjusted_VIC2))+
+  geom_point()+
+  geom_smooth(method = lm)
+
+summary(lm(adjusted_VIC2~geo_dist, data = sweep.df4_first))
+
+# compared with the uncorrected count
+ggplot(sweep.df4_first, aes(x = geo_dist, y = box_sum_bats2))+
+  geom_point()+
+  geom_smooth(method = lm)
+
+summary(lm(box_sum_bats2~geo_dist, data = sweep.df4_first))
+
+# compare uncorrected and corrected
+ggplot(sweep.df4_first, aes(x = box_sum_bats2, y = adjusted_VIC2, color = geo_dist))+
+  geom_abline (slope=1, intercept = 0, linetype = "dashed", color="white", size = 2)+
+  geom_point()+
+  geom_smooth(method = lm, size = 2, color = "black")
+
+```
+
+# Prepare final data
+
+```{r}
+## add in the adjust_VIC
+names(sweep.df4_first)[35] = "adjusted_VIC"
+count.df = left_join(count.df, 
+                     sweep.df4_first[c("box_sum_bats2", "adjusted_VIC", "adjust_ratio", "filename_det_idx")],
+                     by = "filename_det_idx",
+                     multiple = "first")
+
+# filter out the count over 6 millions in adjusted counts
+count.df = count.df %>% filter(adjusted_VIC < 6000000)
+
+################################################################################
+# mutate new summary stats
+delete.df = read.csv("./Data/8_deleted_tracks.csv")
+
+count.df = read.csv("./Data/8.5_count.df.csv") %>% 
+  mutate(fake_date = as.Date(fake_date),
+         local_date = as.Date(local_date)) %>% 
+  filter(!track_id %in% delete.df$track_id)
+
+count.df_from2006 = count.df %>% 
+  filter(year >= 2006) %>% 
+  group_by(track_id) %>% 
+  mutate(track_90q_count = quantile(adjusted_VIC, 0.9)) %>% 
+  ungroup() %>% 
+  group_by(local_date, colony) %>% 
+  mutate(colony_day_count = sum(unique(track_90q_count)))
+
+completness = count.df_from2006 %>% group_by(year, station) %>% summarise(n_day = length(unique(local_date))) %>% ungroup() %>% mutate(m = mean(n_day))
+
+count.df_from2006 = count.df_from2006 %>% 
+  group_by(colony, year) %>% 
+  mutate(obs_n = length(unique(local_date))) %>% 
+  filter(obs_n > 10)
+
+count.df_from2006 = count.df_from2006 %>% group_by(colony) %>% 
+  mutate(n_year = length(unique(year))) %>% 
+  filter(n_year>1)
+
+# use a seperate dataframe to calculate regional daily population (also add up the tracks within a cluster on a day)
+region_day_sum = count.df_from2006 %>% 
+  select(local_date, colony, colony_day_count) %>% 
+  unique() %>% 
+  group_by(local_date) %>% 
+  summarise(day_sum_90q_count = sum(colony_day_count))
+
+count.df_from2006 <- left_join(count.df_from2006, region_day_sum, by = "local_date", multiple = "first")
+
+count.df_from2006 = count.df_from2006 %>% 
+  group_by(fake_date) %>%
+  mutate(year.mean.sameday = mean(day_sum_90q_count))
+
+# write_csv(count.df, "./Data/8.5_count.df.csv")
+write_csv(count.df_from2006, "./Data/8.5_count.df_from2006.csv")
+
+colony.df = read_csv("./Data/colony_info.csv")
+```
+
+## Geospatial Data
+
+```{r Geospatial Data}
+us = vect('./Data/US_State_Boundaries/US_State_Boundaries.shp')
+texas2 = us[us$NAME == "Texas"] # the entire Texas boundary
+texas2_sf <- st_as_sf(texas2)
+
+texas = vect("./Data/SC_Texas/SC_Texas.shp") # a hand-drawn boundary within texas
+bbox <- st_bbox(texas) #prepare the ggplot limit
+texas_6933 <- project(texas, "EPSG:6933")
+polygon_sf <- st_as_sf(texas_6933)
+
+texas_city = vect("./Data/Texas_Cities/Texas_cities.shp")
+texas_city_sf = st_as_sf(texas_city)
+
+radar_texas = read.csv("./Data/radar_texas.csv")
+radar_texas_sf <- st_as_sf(radar_texas, coords = c("LONGITUDE_W", "LATITUDE_N"), crs = 4369)
+radar_texas_sf <- st_transform(radar_texas_sf, crs = 4369)
+
+windturbine = read.csv("./Data/WindTurbine_uswtdb_v7_0_20240510.csv") %>% 
+  filter(t_state == "TX") 
+data <- windturbine[27:28]
+data_sf <- st_as_sf(data, coords = c("xlong", "ylat"), crs = 4326)
+equal_distance_projection <- st_transform(data_sf, crs = 6933)
+windturbine$aea_lon <- st_coordinates(equal_distance_projection)[,1]
+windturbine$aea_lat <- st_coordinates(equal_distance_projection)[,2]
+
+# Get the Google map background of Texas
+# register_google(key = "AIzaSyB6eiD_nfUFhB78udNciIuLZl8slTcituc")
+# tx_map <- get_map(location = c(lon = -99, lat = 30),
+#                   zoom = 7, 
+#                   maptype = "terrain",
+#                   source = "google")
+```
+
+# Phenology
+
+## 1. Phenomix Hierachical Model
+
+```{r model fitting}
+
+count.df = read_csv("./Data/8.5_count.df_from2006.csv") %>% mutate(fake_date = as.Date(fake_date))
+
+# Separately model the spring and fall phenology
+# spring cut-off yday 0 - 200
+# fall cut-off yday 200 - 365
+
+spring_data <- count.df [c("day_sum_90q_count", "yday", "local_date", "year")] %>% 
+  unique() %>% filter(yday >= 0 & yday < 200) %>% 
+  arrange(year)
+fall_data <- count.df [c("day_sum_90q_count", "yday", "local_date", "year")] %>% 
+  unique() %>% filter(yday >= 200 & yday <= 365) %>% 
+  arrange(year)
+
+ggplot(spring_data, aes(x = yday, y = day_sum_90q_count/1000000, group=year, color = year)) +
+  geom_point()+
+  labs(y = "Track Count (millions)")+
+  facet_wrap(~year, ncol = 3)
+
+df = spring_data[c("year", "day_sum_90q_count", "yday")]
+df = as.data.frame(df) # create_data cannot process tibble
+glimpse(df)
+
+#df <- df %>% mutate(yday = ifelse(yday == 366, 365, yday))
+
+cov_dat = data.frame(nyear = unique(df$year))
+cov_dat$nyear = cov_dat$nyear - min(cov_dat$nyear) # rescale year -- could also standardize with scale()
+glimpse(cov_dat)
+
+datalist = phenomix::create_data(df, 
+                       min_number=0, 
+                       variable = "day_sum_90q_count", 
+                       time = "year", 
+                       date = "yday",
+                       asymmetric_model = FALSE, 
+                       mu = ~ nyear,
+                       sigma = ~ nyear,
+                       covar_data = cov_dat,
+                       est_sigma_re = TRUE,
+                       est_mu_re = TRUE,
+                       tail_model = "student_t")
+
+fitted = fit(datalist, control=list(eval.max = 4000, iter.max = 5000, rel.tol = 1e-7))
+```
+
+```{r Examine results}
+fitted$pars$convergence
+extractAIC(fitted)$AIC
+pars(fitted)
+
+date.df = extract_all(fitted) %>% filter(par %in% c("mu", "lower25", "upper75")) %>% 
+  mutate(year = rep(sort(unique(df$year)), 3))
+```
+
+### combine spring and fall results
+
+```{r}
+date.spring = date.df
+date.spring$season = "spring"
+date.spring$weight = 1 / (date.spring$sd^2)
+
+summary(lm(value ~ year, weights = weight, data = date.spring %>% filter(par == "upper75")))
+
+date.spring %>% group_by(par) %>% 
+  summarise(weighted_avg = sum(value * weight) / sum(weight)) %>% 
+  mutate(date = as.Date(weighted_avg, origin = "2014-01-01"))
+
+
+date.fall = date.df
+date.fall$season = "fall"
+date.fall$weight = 1 / (date.fall$sd^2)
+
+summary(lm(value ~ year, weights = weight, data = date.fall %>% filter(par == "upper75")))
+
+date.fall %>% group_by(par) %>% 
+  summarise(weighted_avg = sum(value * weight) / sum(weight)) %>% 
+  mutate(date = as.Date(weighted_avg, origin = "2014-01-01"))
+
+# combine spring and fall after finish running both
+date_seasons_region = rbind(date.spring, date.fall)
+write_csv(date_seasons_region, "./Data/date_seasons_region.csv")
+
+# Perform weighted linear regression for each group in 'par'
+date_seasons_region %>%
+  group_by(par, season) %>%
+  summarise(
+    model = list(lm(value ~ year, data = cur_data(), weights = 1 / (sd^2))),
+    .groups = "drop"
+  ) %>%
+  mutate(tidy_model = map(model, ~ tidy(.x, digits = 3))) %>%
+  unnest(tidy_model) %>% 
+  filter(term=="year")
+```
+
+### Plot the trend regression for spring and 
+
+```{r together}
+date_seasons_region <- date_seasons_region %>%
+  mutate(par_season = interaction(par, season, sep = "_"))
+
+custom_order <- c("upper75_fall", "mu_fall", "lower25_fall", 
+                  "upper75_spring", "mu_spring", "lower25_spring")
+
+# Update the factor levels for par_season
+date_seasons_region <- date_seasons_region %>%
+  mutate(par_season = factor(par_season, levels = custom_order))
+
+ggplot(date_seasons_region, aes(x = year, y = value, color = par_season, group = par_season)) +
+  geom_errorbar(aes(ymin = value - sd, ymax = value + sd), width = 0.2) +
+  stat_smooth(
+    method = 'lm', 
+    aes(weight = 1/(sd^2)),  # Add weights here based on sd.range
+    se = TRUE, 
+    linetype = "dashed", 
+    alpha = 0.1
+  ) +
+  geom_point(size = 3) + 
+  scale_y_continuous(breaks = seq(120, 380, by = 20))+
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  theme_classic()+ 
+  scale_color_viridis_d(labels = c("75th (fall)", "mean (fall)", "25th (fall)",
+                                   "75th (spring)", "mean (spring)", "25th (spring)"))+
+  labs(x = "Year", y = "Day of year", color = "Phenology Date", tag = "B")
+
+ggsave("./Plots/publication/Fig 2_Combined_season.pdf", width = 7, height = 6)
+```
+
+```{r seperate}
+p2 = ggplot(date.df, aes(x = year, y = value, color = par)) +
+  geom_errorbar(aes(ymin = value - sd, ymax = value + sd), width = 0.2) +
+  stat_smooth(
+    method = 'lm', 
+    aes(weight = 1/(sd^2)),  # Add weights here based on sd.range
+    se = TRUE, 
+    linetype = "dashed", 
+    alpha = 0.1
+  ) +
+  geom_point(size = 3) + 
+  scale_y_continuous(breaks = seq(120, 180, by = 20))+
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  theme_classic()+ 
+  scale_color_manual(values=c("#5DAC81", "#66BAB7", "#227D51"), 
+                     labels = c("25th percentile", "mean (peak)", "75th percentile"))+
+  labs(title = "Spring Phenology Trend", x = "Year", y = "Day of year", color = "Phenology Date", tag = "B")
+#ggsave("./Plots/publication/Spring Phenology Trend.pdf", width = 7, height = 6)
+
+p4 = ggplot(date.df, aes(x = year, y = value, color = par)) +
+  geom_errorbar(aes(ymin = value - sd, ymax = value + sd), width = 0.2) +
+  stat_smooth(
+    method = 'lm', 
+    aes(weight = 1/(sd^2)),  # Add weights here based on sd.range
+    se = TRUE, 
+    linetype = "dashed", 
+    alpha = 0.1
+  ) +
+  geom_point(size = 3) + 
+  scale_y_continuous(breaks = seq(200, 380, by = 20))+
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  theme_classic()+ 
+  scale_color_manual(values=c("#FBE251", "#DAC9A6", "#FFB11B"), 
+                     labels = c("25th percentile", "mean (peak)", "75th percentile"))+
+  labs(title = "Fall Phenology Trend", x = "Year", y = "Day of year", color = "Phenology metrics", tag = "D")
+#ggsave("./Plots/publication/Fall Phenology Trend.pdf", width = 7, height = 6)
+```
+
+
+```{r}
+# calculate the range between spring and fall
+range_results <- date_seasons_region %>%
+  group_by(year, par) %>%
+  summarise(
+    value = value[season == "fall"] - value[season == "spring"],
+    sd = sqrt(sd[season == "fall"]^2 + sd[season == "spring"]^2),
+    .groups = "drop"
+  ) %>% 
+  mutate(season = "range")
+
+# Plot the trend regression for range
+ggplot(range_results, aes(x = year, y = value, color = par)) +
+  geom_errorbar(aes(ymin = value - sd, ymax = value + sd), width = 0.2) +
+  stat_smooth(method = 'lm', se = TRUE, linetype = "dashed") +
+  geom_point(size = 3) + 
+  labs(title = "Range Trend", x = "Year", y = "Day of year", color = "Phenology metrics")
+ggsave("./Plots/Range Trend.pdf", width = 7, height = 6)
+```
+
+
+### Population Impact
+
+```{r}
+est_normal <- extract_annual(fitted, log=FALSE)
+est_normal$year = sort(unique(df$year))
+
+total_annual = rbind(total_annual, est_normal %>% mutate(season = "spring"))
+total_annual2 = total_annual %>%
+  group_by(year) %>%
+  summarize(
+    value = sum(value, na.rm = TRUE),  # Summing values for each year
+    sd = sqrt(sum(sd^2, na.rm = TRUE)),  # Combining standard deviations
+    season = "annual"  # Add a label for combined season
+  )
+total_annual3 = total_annual2 %>% rbind(total_annual %>% select(-par))
+
+# Weighted linear regression
+summary(lm(value ~ year, data = est_normal, weights = 1/(sd^2)))
+summary(lm(value ~ year, data = total_annual2 %>% filter(year != 2022), weights = 1/(sd^2)))
+summary(lm(value ~ year, data = total_annual %>% filter(season == "fall" & year != 2022), weights = 1/(sd^2)))
+
+# trying to understand if extract_annual is limited within the season. IT's not.
+# names(fitted$sdreport$value)
+
+# rebuild data frame
+predict.df <- predict(fitted) %>% 
+  mutate(pred.exp = exp(pred)) %>% 
+  mutate(years = (years-1)*2+2006)
+
+  # join in mean
+mus <- data.frame(
+    years = unique(predict.df$years),
+    peak_date = fitted$sdreport$value[which(names(fitted$sdreport$value) == "mu")]
+)
+
+predict.df <- left_join(predict.df, mus)
+predict.df$timing <- as.factor(ifelse(predict.df$x < predict.df$peak_date, "pre", "post"))
+pop_impact = predict.df %>% group_by(years) %>% summarise(year_tot = sum(exp(pred)),
+                                             n_days = n())
+  
+if(fitted$data_list$family %in% c(2,3,5)) {
+      ggplot(predict.df, aes(x, exp(pred), fill = timing, col = timing)) +
+        facet_wrap(~years, scales = "free") +
+        xlab("Calendar day") +
+        ylab("Ln pred and obs") +
+        geom_point(aes(x, y, fill = timing, col = timing), size = 1, alpha = 0.5) +
+        geom_line(col = "black")
+}
+
+season.prediction = rbind(season.prediction, predict.df %>% mutate(season = "fall"))
+write_csv(season.prediction, "./Data/season.prediction.csv")
+```
+
+### Plot pop impact
+```{r}
+g1 = ggplot(total_annual %>% filter(season=="spring"), aes(x = year, y = value/1000000)) +
+  geom_errorbar(aes(ymin = (value - sd)/1000000, ymax = (value + sd)/1000000), width = 0.2, color="black") +
+  stat_smooth(
+    method = 'lm', 
+    aes(weight = 1/(sd^2)),  # Add weights here based on sd.range
+    se = TRUE, 
+    linetype = "dashed", 
+    fill = "#227D51", alpha = 0.2, color = "#227D51"
+  ) +
+  geom_point(size = 3, color = "black") + 
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  labs(x = "Year", y = "Counts (millions)", tag = "A")+
+  theme_classic()
+
+g2 = ggplot(total_annual %>% filter(season=="fall"), aes(x = year, y = value/1000000)) +
+  geom_errorbar(aes(ymin = (value - sd)/1000000, ymax = (value + sd)/1000000), width = 0.2, color="black") +
+  stat_smooth(
+    method = 'lm', 
+    aes(weight = 1/(sd^2)),  # Add weights here based on sd.range
+    se = TRUE, 
+    linetype = "dashed", 
+    fill = "#FFB11B", alpha = 0.2, color = "#FFB11B"
+  ) +
+  geom_point(size = 3, color = "black") + 
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  labs(x = "Year", y = "Counts (millions)", tag = "B")+
+  theme_classic()
+
+g3 = ggplot(total_annual2, aes(x = year, y = value/1000000)) +
+  geom_errorbar(aes(ymin = (value - sd)/1000000, ymax = (value + sd)/1000000), width = 0.2, color="black") +
+  stat_smooth(
+    method = 'lm', 
+    aes(weight = 1/(sd^2)),  # Add weights here based on sd.range
+    se = TRUE, 
+    linetype = "dashed", 
+    fill = "#919736", alpha = 0.2, color = "#919736"
+  ) +
+  geom_point(size = 3, color = "black") + 
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  labs(x = "Year", y = "Counts (millions)", tag = "C")+
+  theme_classic()
+
+total_annual3$season <- factor(total_annual3$season, levels = c("annual", "spring", "fall"))
+
+png("./Plots/publication/Fig 5.png", width = 16, height = 5, res = 600, units = "in")
+ggplot(total_annual3, aes(x = year, y = value/1000000, color = season)) +
+  geom_errorbar(aes(ymin = (value - sd)/1000000, ymax = (value + sd)/1000000), width = 0.2, color="black") +
+  stat_smooth(data = total_annual3 %>% filter(year != 2022), method = 'lm', 
+              aes(weight = 1/(sd^2)), se = TRUE, linetype = "dashed", alpha = 0.1) +
+  stat_smooth(method = 'lm', aes(weight = 1/(sd^2)), se = TRUE, alpha = 0.1) +
+  geom_point(size = 3, color = "black") + 
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  labs(x = "Year", y = "Regional population impact counts (millions)")+
+  theme_classic()+
+  theme(legend.position = "none")+
+  scale_color_viridis_d()+
+  facet_wrap(~season, scales = "free_y")
+dev.off()
+
+```
+
+
+### Plot the fitted curve for each year of spring/fall data
+```{r}
+p1 = plot_diagnostics(fitted, type = "timing", logspace = FALSE)+ 
+  labs(title = "Spring Phenology", x = "Day of year", y = "Count", tag = "A") + 
+  scale_y_continuous(limits = c(0, 10000000), labels = unit_format(unit = "", scale = 1e-6))+
+  facet_wrap(~ years, nrow = 3, 
+             labeller = labeller(years = c("1" = "2006", "2" = "2008", "3" = "2010", "4" = "2012", 
+                                           "5" = "2014", "6" = "2016", "7" = "2018", "8" = "2020", "9" = "2022")))+
+  theme(legend.position = "none")
+
+
+p3 = plot_diagnostics(fitted, type = "timing", logspace = FALSE)+ 
+  labs(title = "Fall Phenology", x = "Day of year", y = "Count (millions)", tag = "C") + 
+  scale_y_continuous(limits = c(0, 10000000), labels = unit_format(unit = "", scale = 1e-6))+
+  facet_wrap(~ years, nrow = 3, 
+             labeller = labeller(years = c("1" = "2006", "2" = "2008", "3" = "2010", "4" = "2012", 
+                                           "5" = "2014", "6" = "2016", "7" = "2018", "8" = "2020", "9" = "2022")))+
+  theme(legend.position = "none")
+
+pdf("./Plots/publication/Fig 2.pdf", width = 14, height = 10)
+grid.arrange(p1, p2, p3, p4, ncol=2, nrow =2)
+dev.off()
+
+png("./Plots/publication/Fig 5.png", width = 16, height = 7, res = 600, units = "in")
+grid.arrange(g1, g2, g3, ncol=3)
+dev.off()
+```
+
+
+## Method 2: GAM
+
+```{r Method 2: GAM}
+# Fit separate models for each year and predict values
+unique_years <- unique(count.df$year)
+models <- list()
+spring_predictions <- data.frame()
+
+for (yr in unique_years) {
+  data_subset <- subset(spring_data, year == yr)
+  model <- gam(day_sum_90q_count ~ s(yday, k=4), data = data_subset, family = poisson())
+  models[[as.character(yr)]] <- model
+  data_subset$fitted_values <- predict(model, type = "response")
+  
+  # Calculate the day of year with the maximum slope
+  slopes <- diff(data_subset$fitted_values) / diff(data_subset$yday)
+  max_slope_index <- which.max(slopes)
+  yday_max_slope <- data_subset$yday[max_slope_index]
+
+  data_subset$spring_maxrate = yday_max_slope
+  spring_predictions <- rbind(spring_predictions, data_subset)
+}
+
+ggplot(spring_predictions, aes(x = yday, y = day_sum_90q_count/1000000)) +
+  geom_point(alpha = 0.5, size = 0.5, color = "black") +
+  geom_line(aes(y = fitted_values/1000000), color = 'blue', size = 1.5) +
+  geom_vline(aes(xintercept = spring_maxrate), color = "black")+
+  facet_wrap(~ year) +
+  labs(title = "Spring Phenology", x = "Day of Year", y = "Count (millions)")
+
+models <- list()
+fall_predictions <- data.frame()
+
+for (yr in unique_years) {
+  data_subset <- subset(fall_data, year == yr)
+  model <- gam(day_sum_90q_count ~ s(yday, k=4), data = data_subset, family = poisson())
+  models[[as.character(yr)]] <- model
+  data_subset$fitted_values <- predict(model, type = "response")
+  
+  # Calculate the day of year with the maximum slope
+  slopes <- diff(data_subset$fitted_values) / diff(data_subset$yday)
+  min_slope_index <- which.min(slopes)
+  yday_min_slope <- data_subset$yday[min_slope_index]
+  
+  data_subset$fall_minrate = yday_min_slope
+  fall_predictions <- rbind(fall_predictions, data_subset)
+}
+
+ggplot(fall_predictions, aes(x = yday, y = day_sum_90q_count/1000000)) +
+  geom_point(alpha = 0.5, size = 0.5, color = "black") +
+  geom_line(aes(y = fitted_values/1000000), color = 'blue', size = 1.5) +
+  geom_vline(aes(xintercept = fall_minrate), color = "black")+
+  facet_wrap(~ year) +
+  labs(title = "Fall Phenology", x = "Day of Year", y = "Count (millions)")
+
+combined_metrics <- rbind(spring_predictions[c("year", "spring_maxrate")] %>% unique() %>% rename(phenology = spring_maxrate), 
+                          fall_predictions[c("year", "fall_minrate")] %>% unique() %>% rename(phenology = fall_minrate))
+combined_metrics$season <- factor(c(rep("Spring", length(unique_years)), rep("Fall", length(unique_years))))
+
+# get rid of outliers
+combined_metrics = combined_metrics %>% 
+  mutate(phenology = ifelse(season=="Spring" & year == 2004, NA, phenology))
+combined_metrics = combined_metrics %>% 
+  mutate(phenology = ifelse(season=="Fall" & year == 2000, NA, phenology))
+combined_metrics = combined_metrics %>% 
+  mutate(phenology = ifelse(season=="Fall" & year == 2006, NA, phenology))
+
+# Plotting
+ggplot(combined_metrics, aes(x = year, y = phenology, color = season)) +
+  geom_point() +
+  geom_smooth(method = "lm") +  # Smoothing line without confidence interval
+  labs(title = "Phenology Trend", x = "Year", y = "Day of Year (max changing rate)") +
+  scale_y_continuous(limits=c(50,350), breaks=seq(50,350, by = 25))+
+  theme_classic()
+
+ggsave("./Plots/phenology_trend.pdf", width = 6, height = 5)
+
+summary(lm(phenology ~ year, data = combined_metrics %>% filter(season=="Fall")))
+```
+
+## Method 3: Raw data following Stepaian et al.
+
+```{r Method 3: Raw data following Stepaian et al.}
+### Stepanian et. al. way to extract phenophases 
+
+#Start of spring: first date passing 50% of the summer mean population
+#Parturition: first occurrence after ordinal date 159 (June 8) surpassing 125% of the summer mean population
+#Pup flight: first occurrence after ordinal date 199 (July 18) surpassing 125% of the summer mean population
+#End of fall dispersal: final date surpassing 50% of the summer mean
+#Summer mean: July and August
+
+#model the raw data first
+
+df = count.df [c("day_sum_90q_count", "yday", "local_date", "year")] %>% unique()
+unique_years <- unique(df$year)
+models <- list()
+predictions <- data.frame()
+
+for (yr in unique_years) {
+  data_subset <- subset(df, year == yr)
+  model <- bam(day_sum_90q_count ~ s(yday, k = 5), data = data_subset, family = poisson(), method = "REML")
+  models[[as.character(yr)]] <- model
+  data = data.frame(yday = 0:365)
+  data$fitted_values <- predict(model, newdata = data, type = "response")
+  data$year = yr
+  predictions <- rbind(predictions, data)
+}
+
+
+ggplot() +
+  geom_point(df, mapping = aes(x = yday, y = day_sum_90q_count/1000000, color = year), alpha = 0.4, shape = 21) +  # Raw data points
+  geom_line(predictions, mapping = aes(x = yday, y = fitted_values/1000000, color = year), size = 2) +  # Fitted values
+  geom_hline(summer_data, mapping = aes(yintercept = summer_mean/1000000))+
+  facet_wrap(~ year, scales = "free_y") +  # Separate plot for each year
+  labs(title = "Day Sum 90q Count Over Day of Year for Each Year",
+       x = "Day of Year",
+       y = "Day Sum 90q Count (millions)") +
+  theme_minimal() +
+  theme(legend.position = "none")
+
+ggsave("./Plots/region_gam_splines.pdf", width = 16, height = 10)
+
+# define phenophases based on summer population
+
+summer_data <- count.df [c("day_sum_90q_count", "yday", "local_date", "year")] %>% 
+  unique() %>% filter(yday >= 182 & yday < 243) %>% 
+  group_by(year) %>% 
+  mutate(summer_mean = mean(day_sum_90q_count))
+
+ggplot(summer_data, aes(x = year, y = summer_mean/1000000)) +
+  geom_point() +
+  geom_smooth(method = "lm") +  # Smoothing line without confidence interval
+  labs(title = "Summer mean population trend", x = "Year", y = "count (millions)") +
+  theme_classic()
+
+phenophases <- count.df [c("day_sum_90q_count", "yday", "local_date", "year")] %>% 
+  group_by(year) %>% 
+  mutate(
+    summer_mean = mean(day_sum_90q_count[yday >= 182 & yday < 243]),
+    spring_arrival = min(yday[yday >= 0 & day_sum_90q_count > 0.5 * summer_mean], na.rm = TRUE),
+    parturition = min(yday[yday > 159 & day_sum_90q_count > 1.25 * summer_mean], na.rm = TRUE),
+    pup_flight = min(yday[yday > 199 & day_sum_90q_count > 1.25 * summer_mean], na.rm = TRUE),
+    fall_dispersal = max(yday[yday >= 0 & day_sum_90q_count > 0.5 * summer_mean], na.rm = TRUE)
+  ) %>% 
+  select(year, spring_arrival, parturition, pup_flight, fall_dispersal) %>% 
+  unique()
+
+# Check for cases where no date meets the condition, assign NA in such cases
+phenophases <- phenophases %>% 
+  mutate(
+    spring_arrival = ifelse(is.infinite(spring_arrival), NA, spring_arrival),
+    parturition = ifelse(is.infinite(parturition), NA, parturition),
+    pup_flight = ifelse(is.infinite(pup_flight), NA, pup_flight),
+    fall_dispersal = ifelse(is.infinite(fall_dispersal), NA, fall_dispersal)
+  )
+
+# Reshape the data for plotting
+phenophases_long <- phenophases %>% 
+  pivot_longer(cols = -year, names_to = "phenophase", values_to = "yday")
+
+# Plot the data
+ggplot(phenophases_long, aes(x = year, y = yday, color = phenophase)) +
+  geom_point(alpha = 0.5) +
+  geom_smooth(aes(group = phenophase), method = "lm", se = F) +
+  scale_y_continuous(limits=c(50,350), breaks=seq(50,350, by = 25))+
+  theme_classic()
+
+summary(lm(parturition ~ year, data = phenophases))
+```
+
+# Population
+
+```{r}
+count.df = read_csv("./Data/8.5_count.df_from2006.csv") %>% mutate(fake_date = as.Date(fake_date))
+```
+
+
+## 1. Annual population
+
+```{r Annual population}
+size.df <- count.df[c("cluster_ID", "colony", "year","month","local_date", "fake_date", "colony_day_count", "roost_type", "ctr_lon", "ctr_lat")] %>% 
+  unique() %>% 
+  group_by(cluster_ID, year) %>% 
+  mutate(p90_count = quantile(track_90q_count, 0.9)) # Calculate the 90th percentile count in each group
+
+size.df2 <- size.df %>%
+  select(cluster_ID, colony, roost_type, ctr_lon, ctr_lat, p90_count, year) %>%  # Ensure 'year' is included
+  unique() %>%
+  group_by(cluster_ID) %>%
+  mutate(colony_size = mean(p90_count, na.rm = TRUE))  # Calculate the mean of p90_count for each cluster_ID
+
+coordinates <- st_as_sf(size.df2, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+coordinates_transformed <- st_transform(coordinates, crs = 4326)
+size.df2 <- cbind(size.df2, st_coordinates(coordinates_transformed))
+
+#ggmap(tx_map) +
+ggplot()+
+  geom_sf(data = texas2_sf, fill = NA, color="black")+
+  coord_sf(xlim = c(bbox$xmin, bbox$xmax), ylim = c(bbox$ymin, bbox$ymax-0.7)) +
+  geom_point(data = size.df2, aes(x = X, y = Y, size = colony_size/1000000, color = colony_size/1000000)) +
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 3)+
+  scale_color_viridis(direction = 1, begin = 0.3, end = 1, option = "viridis", guide = "legend") + 
+  scale_size_continuous(range = c(1, 8)) +  # Adjust point size range
+  theme_light() +
+  labs(title = "Mexican free-tailed bats colony size in south-central Texas",
+       x = "Longitude",
+       y = "Latitude",
+       size = "Counts (millions)",
+       color = "Counts (millions)")+
+    theme(legend.position = "bottom")
+# ggsave("./Plots/Colony size.pdf", width = 8, height = 8)
+
+# ggplot()+
+#   geom_sf(data = polygon_sf, fill = "white", color = "black")+
+#   geom_point(data = size.df2, aes(x = X, y = Y, size = colony_size/1000000, color = as.numeric(cluster_ID))) +
+#   geom_point(data = windturbine, aes(x = xlong, y = ylat, fill = t_hh), color = "white", shape=21) +
+#   scale_size_continuous(range = c(1, 10), breaks = breaks_extended(3)) +  # Adjust point size range
+#   scale_color_viridis(direction = -1) + 
+#   scale_fill_viridis(option="magma") +
+#   coord_sf(xlim = c(bbox$xmin, bbox$xmax), ylim = c(bbox$ymin, bbox$ymax)) +
+#   dark_theme_light() +
+#   labs(title = "Mexican free-tailed bats colony size in south-central Texas",
+#        x = "Longitude",
+#        y = "Latitude",
+#        size = "Counts (millions)",
+#        color = "Cluster ID",
+#        fill = "Wind Turbin Heights (m)")
+# ggsave("./Plots/Colony size w wind turbine_SC.pdf", width = 9, height = 6)
+```
+
+```{r Interannual population dynamics by roost type}
+aggregated_data <- unique(size.df2[c("year", "roost_type", "p90_count")]) %>%
+  group_by(year, roost_type) %>%
+  summarize(p90_count_typesum = sum(p90_count, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(aggregated_data, aes(x = year, y = p90_count_typesum / 1000000, color = roost_type)) +
+  geom_point(size = 3) +
+  geom_line(aes(group = roost_type), size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Interannual Population Dynamics of Colonies",
+    x = "Year",
+    y = "Counts (millions)",
+    color = "Roost type"
+  ) +
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  theme(legend.position = "bottom")
+# ggsave("./Plots/Internnual Populatin by roost type.pdf", width = 5, height = 6)
+
+# Linear regressions for trend (make sure to specify "map" function is from purrr package)
+lm_stats =
+  size.df2 %>% 
+  nest(data = -colony) %>% 
+  mutate(model = purrr::map(data, ~lm(p90_count ~ year, data = .)), 
+         tidied = purrr::map(model, tidy, conf.int = TRUE, conf.level=0.95)) %>%
+  unnest(tidied) %>% 
+  filter(term=="year") %>% 
+  mutate(CI95 = conf.high-estimate)
+
+# Ensure your cluster_ID is sorted
+lm_stats <- lm_stats %>%
+  arrange(estimate) %>%  # Arrange by estimate in ascending order
+  mutate(colony = factor(colony, levels = unique(colony)))  # Ensure the factor ordering
+
+# Create the boxplot with error bars
+ggplot(lm_stats, aes(x = colony, y = estimate)) +
+  geom_boxplot() +  # Boxplot of estimates
+  geom_errorbar(aes(ymin = conf.low, ymax = conf.high), width = 0.2) +  # Confidence intervals as error bars
+  labs(x = "Colony", y = "Estimate") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1)) +  # Rotate x-axis labels for readability
+  coord_flip()  # Optional: flip coordinates for easier viewing of many clusters
+
+ggplot(size.df2, aes(x = year, y = p90_count/1000000)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ colony) +
+  theme_minimal() +
+  labs(title = "Population over years by Colony",
+       x = "Year",
+       y = "population (millions)")
+```
+
+```{r Trend}
+model.allyear <- lmerTest::lmer(p90_count ~ year + (1 | colony), data = size.df2)
+summary(model.allyear)
+
+# Add predicted values to the original dataset
+size.df2$predicted <- predict(model.allyear, re.form = NA)
+
+# Create the plot
+ggplot(size.df2, aes(x = year, y = p90_count/1000000)) +
+  geom_point(alpha = 0.6) + # Original data points
+  geom_smooth(method = "lm")+
+  #geom_line(aes(y = predicted), color = "black", size = 1) + # Regression line
+  labs(#title = "Fixed Effect of Year on Mean Annual Population",
+       x = "Year",
+       y = "Annual 90th percentile population (millions)") +
+  dark_theme_minimal()
+# ggsave("./Plots/Annual trend.pdf", width = 5, height = 6)
+```
+
+## 2. Overwintering population
+
+```{r Data and Interannual}
+overwintering.df = count.df[c("cluster_ID", "colony", "month", "year", "local_date", "fake_date", "track_90q_count", "roost_type", "ctr_lon", "ctr_lat")] %>% 
+  unique() %>% 
+  filter(month==12 | month==1) %>% 
+  group_by(cluster_ID, year) %>% 
+  mutate(mean_overwinter = mean(track_90q_count))
+
+overwinter_aggregated <- unique(overwintering.df[c("year", "roost_type", "mean_overwinter")]) %>%
+  group_by(year, roost_type) %>%
+  summarize(overwinter.sum = sum(mean_overwinter, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(overwinter_aggregated, aes(x = year, y = overwinter.sum/1000000, color = roost_type)) +
+  geom_point(size = 3) +
+  geom_line(aes(group = roost_type), size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Interannual overwintering population of colonies (Dec + Jan)",
+    x = "Year",
+    y = "Counts (millions)",
+    color = "roost type"
+  ) +
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  theme(legend.position = "bottom")
+# ggsave("./Plots/Interannual overwintering population of colonies.pdf", width = 5, height = 6)
+
+overwintering.df2 = overwintering.df[c("cluster_ID", "year", "ctr_lon", "ctr_lat", "mean_overwinter", "colony")] %>% 
+  unique() %>% 
+  group_by(cluster_ID) %>% 
+  mutate(allyearmean_overwinter = mean(mean_overwinter),
+         p90_overwinter = quantile(mean_overwinter, 0.9),
+         num_year = n()) %>% 
+  filter(num_year>=5)
+
+coordinates <- st_as_sf(overwintering.df2, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+coordinates_transformed <- st_transform(coordinates, crs = 4326)
+overwintering.df2 <- cbind(overwintering.df2, st_coordinates(coordinates_transformed))
+
+ggplot()+
+  geom_sf(data = texas2_sf, fill = NA, color="black")+
+  coord_sf(xlim = c(bbox$xmin, bbox$xmax), ylim = c(bbox$ymin, bbox$ymax-0.7)) +
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 3, color = "black")+
+  geom_point(data = overwintering.df2, aes(x = X, y = Y, size = allyearmean_overwinter/1000000, 
+                                           color = allyearmean_overwinter/1000000)) +
+  scale_color_viridis(direction = 1, begin = 0.3, end = 1, option = "viridis", guide = "legend") + 
+  scale_size_continuous(range = c(1, 8)) +  # Adjust point size range
+  theme_light() +
+  labs(title = "Mexican free-tailed bats wintering colony size (Dec + Jan)",
+       x = "Longitude",
+       y = "Latitude",
+       size = "Counts (millions)",
+       color = "Counts (millions)")+
+  theme(legend.position = "bottom")
+# ggsave("./Plots/Overwintering colony size.pdf", width = 8, height = 8)
+
+lm_stats_overwinter =
+  overwintering.df2 %>% 
+  nest(data = -colony) %>% 
+  mutate(model = purrr::map(data, ~lm(mean_overwinter~year, data = .)), 
+         tidied = purrr::map(model, tidy, conf.int = TRUE, conf.level=0.95)) %>% 
+  unnest(tidied) %>% 
+  filter(term=="year") %>% 
+  mutate(CI95 = conf.high-estimate)
+
+# Trend by cluster
+ggplot(overwintering.df2, aes(x = year, y = mean_overwinter/1000)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  facet_wrap(~ colony) +
+  theme_minimal() +
+  labs(title = "Overwinter population over years by Colony",
+       x = "Year",
+       y = "Overwinter population (thousands)")
+# ggsave("./Plots/Overwintering colony trends.pdf", width = 12, height = 10)
+```
+
+```{r Trend}
+overwintering.df3 = overwintering.df2[c("mean_overwinter", "year", "colony")] %>% unique()
+model.overwinter <- lmerTest::lmer(mean_overwinter ~ year + (1 | colony), data = overwintering.df3)
+summary(model.overwinter)
+
+# Add predicted values to the original dataset
+overwintering.df3$predicted <- predict(model.overwinter, re.form = NA)
+
+ggplot(overwintering.df3, aes(x = year, y = mean_overwinter/1000)) +
+  geom_point(alpha = 0.6) + # Original data points
+  geom_smooth(method = "lm")+
+  labs(#title = "Fixed Effect of Year on Mean Overwinter",
+       x = "Year",
+       y = "Mean overwinter population (thousands)") +
+  dark_theme_minimal()
+# ggsave("./Plots/Overwinter trend.pdf", width = 5, height = 6)
+```
+
+## Summer Population
+
+```{r}
+summer.df = count.df[c("cluster_ID", "colony", "month", "year", "local_date", "fake_date", "track_90q_count", "roost_type", "ctr_lon", "ctr_lat")] %>% 
+  unique() %>% 
+  filter(month==7 | month==8) %>% 
+  group_by(cluster_ID, year) %>% 
+  mutate(mean_summer = mean(track_90q_count))
+
+summer.df2 = summer.df[c("cluster_ID", "year", "ctr_lon", "ctr_lat", "mean_summer", "colony")] %>% 
+  unique() %>% 
+  group_by(cluster_ID) %>% 
+  mutate(allyearmean_summer = mean(mean_summer),
+         p90_summer = quantile(mean_summer, 0.9),
+         num_year = n()) %>% 
+  filter(num_year>=3)
+
+coordinates <- st_as_sf(summer.df2, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+coordinates_transformed <- st_transform(coordinates, crs = 4326)
+summer.df2 <- cbind(summer.df2, st_coordinates(coordinates_transformed))
+
+ggplot()+
+  geom_sf(data = texas2_sf, fill = NA, color="grey")+
+  coord_sf(xlim = c(bbox$xmin+0.5, bbox$xmax-0.5), ylim = c(bbox$ymin, bbox$ymax-0.7)) +
+  geom_point(data = summer.df2, aes(x = X, y = Y, size = allyearmean_summer/1000000, 
+                                           color = num_year)) +
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 3, color = "black")+
+  #scale_color_viridis(direction = 1, begin = 0.3, end = 1, option = "viridis", guide = "legend") + 
+  scale_size_continuous(breaks = seq(0, 0.7, 0.2), range = c(1, 13)) +  # Adjust point size range
+  theme_light() +
+  labs(title = "Mexican free-tailed bats summer colony size (Jul + Aug)",
+       x = "Longitude",
+       y = "Latitude",
+       size = "Counts (millions)",
+       color = "Persistency (years)")+
+  theme(legend.position = "bottom")
+
+summer_aggregated <- unique(summer.df[c("year", "roost_type", "mean_summer")]) %>%
+  group_by(year, roost_type) %>%
+  summarize(summer.sum = sum(mean_summer, na.rm = TRUE)) %>%
+  ungroup()
+
+ggplot(summer_aggregated, aes(x = year, y = summer.sum/1000000, color = roost_type)) +
+  geom_point(size = 3) +
+  geom_line(aes(group = roost_type), size = 1) +
+  theme_minimal() +
+  labs(
+    title = "Interannual summer population of colonies (Jul + Aug)",
+    x = "Year",
+    y = "Counts (millions)",
+    color = "roost type"
+  ) +
+  scale_x_continuous(breaks = seq(2006, 2022, 2))+
+  theme(legend.position = "bottom")
+```
+
+## 3. Monthly Population
+
+```{r Plot}
+# Data manipulation to include all months
+monthly.df <- count.df %>%
+  select(cluster_ID, colony, month, year, local_date, fake_date, track_90q_count, roost_type, ctr_lon, ctr_lat) %>%
+  unique() %>%
+  group_by(cluster_ID, year, month) %>%
+  mutate(p90_monthly = quantile(track_90q_count, 0.9))
+
+monthly.df2 <- monthly.df %>%
+  unique() %>%
+  group_by(cluster_ID, month) %>%
+  mutate(allyearQ90 = mean(p90_monthly),
+         num_year = length(unique(year)))
+
+coordinates <- st_as_sf(monthly.df2, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+coordinates_transformed <- st_transform(coordinates, crs = 4326)
+monthly.df2 <- cbind(monthly.df2, st_coordinates(coordinates_transformed))
+
+animated_plot <- ggplot() +
+  geom_sf(data = texas2_sf, fill = NA)+
+  coord_sf(xlim = c(bbox$xmin, bbox$xmax-0.3), ylim = c(bbox$ymin, bbox$ymax-0.7)) +
+  geom_point(data = monthly.df2, aes(x = X, y = Y, size = allyearQ90 / 1000000, color = allyearQ90 / 1000000)) +
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 3)+
+  scale_color_viridis(direction = 1, begin = 0.3, end = 1, option = "viridis", guide = "legend") + 
+  scale_size_continuous(range = c(1, 8)) +
+  dark_theme_minimal() +
+  labs(title = "Mexican free-tailed bats overwintering colony size in south-central Texas (Monthly)",
+       x = "Longitude",
+       y = "Latitude",
+       size = "Counts (millions)",
+       color = "Counts (millions)")+
+  transition_manual(frames = month) +
+  labs(title = "Month: {current_frame}")
+
+# Animate and save the plot as a GIF
+animate(animated_plot, duration = 10, fps = 2, width = 2400, height = 1800, res = 300, renderer = gifski_renderer("./Plots/monthly_colony_size2.gif"))
+
+```
+
+## 4. Visualize specific colony
+
+```{r All colonies}
+for (c in unique(count.df$colony)){
+  roost.df = count.df %>% 
+    filter(colony == c) %>% 
+    group_by(local_date) %>% 
+    mutate(colony_day_count = sum(unique(track_90q_count))) %>% 
+    ungroup()
+    
+  roost.median = roost.df %>% 
+    group_by(fake_date) %>%
+    summarise(roost.year.median = median(colony_day_count))
+
+  a = ggplot() +
+    geom_line(roost.df, mapping = aes(x = fake_date, y = colony_day_count/1000000, group=year, color = year), alpha = 0.8)+
+    geom_line(roost.median, mapping = aes(x = fake_date, y = roost.year.median/1000000), size = 1, color = "black")+
+    scale_x_date(date_breaks = "months", date_labels = "%b")+
+    scale_color_viridis(breaks = c(seq(2006, 2022, 4)))+
+    theme_light()+
+    labs(x="Month", y="Count (millions)", title = c)
+  
+  b = ggplot(roost.df, aes(x = fake_date, y = colony_day_count/1000000, group=year, color = year)) +
+    geom_point()+
+    geom_line()+
+    scale_x_date(date_breaks = "months", date_labels = "%b")+
+    labs(x="Month", y="Count (millions)", title = c)+
+    facet_wrap(~year, ncol = 3)+
+    theme_light()+
+    ggtitle(c)
+  
+  pdf(paste("./Plots/Raw_data_visual/", c, ".pdf", sep=""), width = 12, height = 13)
+  grid.arrange(a, b, ncol=1)
+  dev.off()
+}
+
+```
+
+```{r}
+estimate_summer_pop = count.df %>% filter(month == 7 | month == 8) %>% 
+  group_by(colony) %>% 
+  summarise(est_summer_pop = quantile(colony_day_count, 0.9))
+```
+
+```{r Bracken Cave density}
+c = "1"
+roost.df = count.df %>% 
+  filter(cluster_ID == c) %>% 
+  group_by(track_id) %>%
+  mutate(max.count.r = r[which.max(box_sum_bats)]) %>% 
+  group_by(fake_date) %>% 
+  mutate(roost.year.max.den = median(track_90q_count/max.count.r)) # Density metric
+roost.mean = unique(select(roost.df, fake_date, roost.year.max.den))
+
+# "density" plot
+ggplot() +
+  geom_line(roost.df, mapping = aes(x = fake_date, y = track_90q_count/max.count.r, group=year, color = year), alpha = 0.7)+
+  geom_line(roost.mean, mapping = aes(x = fake_date, y = roost.year.max.den), color = "black", size = 1.5)+
+  scale_x_date(breaks = date_breaks("months"), labels = date_format("%b"))+
+  scale_color_viridis()+
+  theme_light()+
+  geom_stripped_cols()
+```
+
+## 5. Regional yearly activity plot
+
+```{r}
+mean.df = unique(select(count.df, fake_date, year.mean.sameday))
+
+ggplot() +
+  geom_line(count.df, mapping = aes(x = fake_date, y = day_sum_90q_count/1000000, group=year, color = year), alpha = 0.7)+
+  geom_line(mean.df, mapping = aes(x = fake_date, y = year.mean.sameday/1000000), color = "black", size = 1.5)+
+  scale_x_date(breaks = date_breaks("months"), labels = date_format("%b"))+
+  scale_color_viridis(breaks = c(seq(2006, 2022, 4)))+
+  theme_classic()+
+  labs(y = "Count (millions)", x = "Month", tag = "C")+
+  geom_stripped_cols()
+ggsave("./Plots/region_rawcurve.png", width = 12, height = 6)
+
+ggplot(count.df, aes(x = fake_date, y = day_sum_90q_count/1000000, group=year, color = year)) +
+  geom_line()+
+  scale_x_date(breaks = date_breaks("months"), labels = date_format("%b"))+
+  labs(y = "90th Quantile Track Count (millions)", x = "Month")+
+  facet_wrap(~year, ncol = 3)
+ggsave("./Plots/region_yearly.png", width = 13, height = 6)
+
+ggplot(count.df, aes(x = fake_date, y = day_sum_90q_count/1000000, group=year, color = year)) +
+  geom_point()+
+  geom_smooth(method="gam", formula=y~s(x), method.args=list(family="nb", method="REML"), color="black")+
+  scale_x_date(date_labels = "%b")+
+  labs(y = "90th Quantile Track Count (millions)", x = "Month")+
+  facet_wrap(~year, ncol = 3)
+ggsave("./Plots/region_gam.png", width = 13, height = 6)
+
+###################################################
+# check if distance to radar has a bias for counts
+options(scipen = 999)
+ggplot(count.df, aes(x = geo_dist, y = adjusted_VIC)) +
+  geom_smooth(method='lm', se=T)+
+  labs(y = "Detection Count (millions)", x = "Distance to closest radar station (m)")+
+  theme_classic()
+
+cor.test(count.df$adjusted_VIC, count.df$geo_dist)
+summary(lm(adjusted_VIC ~ geo_dist, data = count.df))
+count.df %>%
+  group_by(station) %>%
+  summarise(correlation = cor(adjusted_VIC, geo_dist))
+
+ggsave("./Plots/dist_count_bias.pdf", width = 7, height = 6)
+```
+
+```{r Texas zoom-out map}
+radar_buffer_sf <- st_buffer(radar_texas_sf, dist = 150000)
+ggplot() +
+  geom_sf(data = texas2_sf, fill = NA, color = "white") +  # Texas boundary
+  geom_sf(data = radar_texas_sf) +  # Radar data points
+  geom_sf_text(data = radar_texas_sf, aes(label = SITE), size = 3, nudge_y = 0.2)+
+  geom_sf(data = radar_buffer_sf, fill = NA, color = "grey", linetype = "dashed") + 
+  dark_theme_void() +
+  labs(x = "Longitude",
+       y = "Latitude")
+ggsave("./Plots/Texas_zoom-out_map.pdf", width = 5, height = 5)
+```
+
+## 6. Composite and First detection map
+
+```{r}
+list = c("KEWX20230716_013309_V06", "KDFX20230716_015250_V06", "KGRK20230716_020518_V06", "KSJT20230716_014735_V06")
+
+i = list[4]
+split_string <- unlist(strsplit(substr(i, 14, 19), "(?<=\\G.{2})", perl = TRUE))
+time = paste0(split_string, collapse=":")
+formatted_date <- as.Date(as.character(substr(i, 5, 12)), format = "%Y%m%d")
+
+# Combine the formatted date and time
+datetime_str <- paste0(formatted_date, " ", time)
+station = substr(i, 1, 4)
+datetime <- as.POSIXct(datetime_str, format = "%Y-%m-%d %H:%M:%S", tz = "UTC")
+
+
+download_pvolfiles(date_min = datetime, 
+                   date_max = datetime,
+                   radar = station, 
+                   directory="./Data/radar_pvol")
+
+my_pvolfiles <- list.files("./Data/radar_pvol", recursive = TRUE, full.names = TRUE, pattern = i)
+
+my_pvol <- read_pvolfile(my_pvolfiles)
+my_scan <- get_scan(my_pvol, 0.5)
+raster_scan = scan_to_raster(my_scan, nx = 300, ny = 300, param = "DBZH")
+scan_df = as.data.frame(raster_scan, xy = TRUE)
+scan_df_filtered <- scan_df %>%
+  filter(!is.na(DBZH))
+ppi4 <- project_as_ppi(my_scan, range_max = 150000)
+
+composite = composite_ppi(x=list(ppi1, ppi2, ppi3, ppi4), res = 1000)
+
+saveRDS(composite, "./Data/composite_radar.rds")
+```
+
+```{r}
+texas_counties <- counties(state = "TX", cb = TRUE, class = "sf")
+texas_cities <- places(state = "TX", cb = TRUE, class = "sf")
+
+ggplot() +
+  geom_sf(data = texas_counties, fill = NA, color = "black") +
+  geom_sf(data = texas_city_sf, size =2) +  # Radar data points
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 4, nudge_y = 0.2)+
+  geom_sf(data = radar_texas_sf, size =2) +  # Radar data points
+  geom_sf_text(data = radar_texas_sf, aes(label = SITE), size = 4, nudge_y = 0.2)+
+  theme_minimal()
+```
+
+```{r}
+library(bioRad)
+library(rosm)
+library(OpenStreetMap)
+library(ggmap)
+
+# this sets your google map for this session
+register_google(key = "")
+basemap = get_map(c(left = -107, bottom = 25, right = -93, top = 37))
+gg_basemap <- ggmap::ggmap(basemap)
+
+gg_basemap +
+  geom_sf(data = raster_scan, aes(x = x, y = y, fill = DBZH), alpha = 0.9) +
+  scale_fill_viridis_c(option = "viridis", limits = c(-20, 40)) +
+  labs(tag = "A") +
+  theme_void() 
+```
+
+```{r}
+firstdetections <- read_csv("Data/4_firstdetections_unduplicated.csv")
+firstdetections$cluster_ID = as.character(firstdetections$cluster_ID)
+
+# Horn et al. "7", "9", "6", "21", "2", "0"
+# Frick et al.  "7", "9", "6", "4", "1"
+# Stepanion et al. "1"
+
+invert_geom_defaults()
+
+m2 = ggplot()+
+  geom_sf(data = texas2_sf, fill = NA, colour = "black")+
+  #geom_point(data = firstdetections %>% filter(cluster_ID == 1| cluster_ID==4| cluster_ID==6| cluster_ID==9| cluster_ID==7| cluster_ID==21| cluster_ID==2| cluster_ID==0), aes(x = lon, y = lat, color = as.character(cluster_ID)), size = 0.1) +
+  geom_point(data = firstdetections, aes(x = lon, y = lat, color = as.character(cluster_ID)), size = 0.1) +
+  geom_sf(data = radar_texas_sf, size =2) +  # Radar data points
+  geom_sf_text(data = radar_texas_sf, aes(label = SITE), size = 4, nudge_y = 0.2)+
+  scale_color_viridis_d(direction = -1, begin = 0, end = 1, option = "viridis") +
+  coord_sf(xlim = c(bbox$xmin, bbox$xmax), ylim = c(bbox$ymin, bbox$ymax-0.5))+
+  theme_void()+
+  theme(legend.position = "none")+
+  labs(tag = "B")
+
+ggsave("./Plots/first detections/S3.pdf", width = 8, height = 5)
+```
+
+## 7. brms colony abundance
+
+
+```{r}
+count.df = read_csv("./Data/8.5_count.df_from2006.csv") %>% mutate(fake_date = as.Date(fake_date))
+
+count.df.brms = count.df %>% 
+  ungroup() %>% 
+  select(colony, local_date, fake_date, year, month, yday, colony_day_count, roost_type) %>% 
+  unique() %>% 
+  group_by(colony) %>% 
+  mutate(total_det_day = n()) %>% 
+  group_by(colony, year) %>% 
+  mutate(obs_n = n()) %>% 
+  filter(obs_n > 10)
+
+count.df.brms = count.df.brms %>% group_by(colony) %>% arrange(desc(total_det_day)) %>% 
+  mutate(n_year = length(unique(year))) %>% 
+  filter(n_year>1)
+```
+
+```{r All colonies}
+for (c in unique(count.df.brms$colony)){
+  roost.df = count.df.brms %>% 
+    filter(colony == c)
+    
+  roost.median = roost.df %>% 
+    group_by(fake_date) %>%
+    summarise(roost.year.median = median(colony_day_count))
+
+  a = ggplot() +
+    geom_line(roost.df, mapping = aes(x = fake_date, y = colony_day_count/1000000, group=year, color = year), alpha = 0.8)+
+    geom_line(roost.median, mapping = aes(x = fake_date, y = roost.year.median/1000000), size = 1, color = "black")+
+    scale_x_date(date_breaks = "months", date_labels = "%b")+
+    scale_color_viridis(breaks = c(seq(2006, 2022, 4)))+
+    theme_light()+
+    labs(x="Month", y="Count (millions)", title = c)
+  
+  b = ggplot(roost.df, aes(x = fake_date, y = colony_day_count/1000000, group=year, color = year)) +
+    geom_point()+
+    geom_line()+
+    scale_x_date(date_breaks = "months", date_labels = "%b")+
+    labs(x="Month", y="Count (millions)", title = c)+
+    facet_wrap(~year, ncol = 3)+
+    theme_light()+
+    ggtitle(c)
+  
+  pdf(paste("./Plots/Raw_data_visual/", c, ".pdf", sep=""), width = 12, height = 13)
+  grid.arrange(a, b, ncol=1)
+  dev.off()
+}
+
+```
+
+
+### Subset the data per colony
+```{r}
+sd_yday = data.frame()
+
+model_list <- list()
+i = 1
+
+for (c in unique(count.df.brms$colony)){
+
+print(i)
+  
+roost.df = count.df.brms %>% 
+  filter(colony == c)
+
+fit <- brm(as.integer(colony_day_count) ~ year + (1 | yday), data = roost.df, 
+           family = negbinomial(), 
+           chains = 4, iter = 4000, warmup = 2000, cores = 8,
+           control = list(adapt_delta = 0.95, max_treedepth = 15))
+
+model_list[[i]] <- fit
+i = i+1
+
+summary_sd_yday <- posterior_summary(fit, pars = "sd_yday__Intercept")
+summary_sd_yday <- data.frame(
+  sd_yday_mean = summary_sd_yday[,"Estimate"],
+  Est.Error = summary_sd_yday[,"Est.Error"],
+  Q2.5 = summary_sd_yday[,"Q2.5"],
+  Q97.5 = summary_sd_yday[,"Q97.5"],
+  colony = c
+)
+sd_yday = rbind(sd_yday, summary_sd_yday)
+}
+
+sd_yday %>%
+  summarise(
+    overall_mean = mean(sd_yday_mean),
+    overall_se = sd(sd_yday_mean) / sqrt(n()),
+    min_value = min(sd_yday_mean),
+    max_value = max(sd_yday_mean)
+  )
+
+write_csv(sd_yday, "./Data/11_colony_sd_yday.csv")
+saveRDS(model_list, "./Data/colony_model_list.rds")
+```
+
+```{r}
+colony_size_posterior = data.frame()
+b_year = data.frame()
+
+for (c in unique(count.df.brms$colony)){
+
+print(c)
+  
+roost.df = count.df.brms %>% 
+  filter(colony == c)
+
+fit <- brm(as.integer(colony_day_count) ~ year + (1 | yday), data = roost.df, 
+           family = negbinomial(), 
+           chains = 4, iter = 4000, warmup = 2000, cores = 8,
+           control = list(adapt_delta = 0.95, max_treedepth = 15))
+
+# Check model summary
+summary(fit)
+plot(fit)
+
+# Extract the posterior summary for the model
+summary_b_year <- posterior_summary(fit, pars = "b_year")
+
+# Create a dataframe to store the mean and 95% CI for b_year
+b_year_df <- data.frame(
+  b_year_mean = summary_b_year[,"Estimate"],
+  Est.Error = summary_b_year[,"Est.Error"],
+  Q2.5 = summary_b_year[,"Q2.5"],
+  Q97.5 = summary_b_year[,"Q97.5"],
+  colony = c
+)
+
+b_year = rbind(b_year, b_year_df)
+
+#----------------
+new_data <- expand.grid(year = unique(roost.df$year), yday = seq(60, 151, 1)) # spring population
+
+# Step 1: Generate posterior predictions for new_data
+posterior_predictions <- posterior_epred(fit, newdata = new_data, allow_new_levels = T)
+
+# Step 2: Calculate the mean and 95% CI across yday within each year
+# Initialize a data frame to store the summary statistics for each year
+yearly_stats <- data.frame(year = unique(new_data$year), mean = NA, lower = NA, upper = NA)
+
+# Loop through each unique year
+for (year in unique(new_data$year)) {
+  # Get the indices of rows in new_data corresponding to the current year
+  year_indices <- which(new_data$year == year)
+  
+  # Subset the posterior predictions for the current year
+  predictions_for_year <- posterior_predictions[, year_indices]
+  
+  # Step 3: Calculate the mean and 95% CI across yday for the current year
+  mean_predictions <- rowMeans(predictions_for_year)
+  ci_lower <- apply(predictions_for_year, 1, quantile, probs = 0.025)
+  ci_upper <- apply(predictions_for_year, 1, quantile, probs = 0.975)
+  
+  # Store the average (mean) across all posterior samples for the year
+  yearly_stats[yearly_stats$year == year, "mean"] <- mean(mean_predictions)
+  yearly_stats[yearly_stats$year == year, "lower"] <- mean(ci_lower)
+  yearly_stats[yearly_stats$year == year, "upper"] <- mean(ci_upper)
+}
+
+colony_size_posterior = rbind(colony_size_posterior, yearly_stats %>% mutate(season = "spring", colony = c))
+
+#---------
+new_data <- expand.grid(year = unique(roost.df$year), yday = seq(152, 243, 1)) # summer population
+posterior_predictions <- posterior_epred(fit, newdata = new_data, allow_new_levels = T)
+
+yearly_stats <- data.frame(year = unique(new_data$year), mean = NA, lower = NA, upper = NA)
+
+for (year in unique(new_data$year)) {
+  year_indices <- which(new_data$year == year)
+  predictions_for_year <- posterior_predictions[, year_indices]
+  mean_predictions <- rowMeans(predictions_for_year)
+  ci_lower <- apply(predictions_for_year, 1, quantile, probs = 0.025)
+  ci_upper <- apply(predictions_for_year, 1, quantile, probs = 0.975)
+  yearly_stats[yearly_stats$year == year, "mean"] <- mean(mean_predictions)
+  yearly_stats[yearly_stats$year == year, "lower"] <- mean(ci_lower)
+  yearly_stats[yearly_stats$year == year, "upper"] <- mean(ci_upper)
+}
+
+colony_size_posterior = rbind(colony_size_posterior, yearly_stats %>% mutate(season = "summer", colony = c))
+
+#---------
+new_data <- expand.grid(year = unique(roost.df$year), yday = seq(244, 334, 1)) # fall population
+posterior_predictions <- posterior_epred(fit, newdata = new_data, allow_new_levels = T)
+
+yearly_stats <- data.frame(year = unique(new_data$year), mean = NA, lower = NA, upper = NA)
+
+for (year in unique(new_data$year)) {
+  year_indices <- which(new_data$year == year)
+  predictions_for_year <- posterior_predictions[, year_indices]
+  mean_predictions <- rowMeans(predictions_for_year)
+  ci_lower <- apply(predictions_for_year, 1, quantile, probs = 0.025)
+  ci_upper <- apply(predictions_for_year, 1, quantile, probs = 0.975)
+  yearly_stats[yearly_stats$year == year, "mean"] <- mean(mean_predictions)
+  yearly_stats[yearly_stats$year == year, "lower"] <- mean(ci_lower)
+  yearly_stats[yearly_stats$year == year, "upper"] <- mean(ci_upper)
+}
+
+colony_size_posterior = rbind(colony_size_posterior, yearly_stats %>% mutate(season = "fall", colony = c))
+
+#---------
+new_data <- expand.grid(year = unique(roost.df$year), yday = c(seq(0, 59), seq(335, 365))) # overwintering population
+posterior_predictions <- posterior_epred(fit, newdata = new_data, allow_new_levels = T)
+
+yearly_stats <- data.frame(year = unique(new_data$year), mean = NA, lower = NA, upper = NA)
+
+for (year in unique(new_data$year)) {
+  year_indices <- which(new_data$year == year)
+  predictions_for_year <- posterior_predictions[, year_indices]
+  mean_predictions <- rowMeans(predictions_for_year)
+  ci_lower <- apply(predictions_for_year, 1, quantile, probs = 0.025)
+  ci_upper <- apply(predictions_for_year, 1, quantile, probs = 0.975)
+  yearly_stats[yearly_stats$year == year, "mean"] <- mean(mean_predictions)
+  yearly_stats[yearly_stats$year == year, "lower"] <- mean(ci_lower)
+  yearly_stats[yearly_stats$year == year, "upper"] <- mean(ci_upper)
+}
+
+colony_size_posterior = rbind(colony_size_posterior, yearly_stats %>% mutate(season = "winter", colony = c))
+}
+
+write_csv(b_year, "./Data/11_colony_abundance_trend.csv")
+write_csv(colony_size_posterior, "./Data/11_colony_abundance_size.csv")
+
+```
+
+### Colony trend plot
+```{r trend plot}
+moreyearcolony = count.df.brms %>% filter(n_year>4) %>% pull(colony) %>% unique()
+
+b_year_more = b_year %>% filter(colony %in% moreyearcolony) %>% 
+  arrange(b_year_mean) %>%
+  mutate(colony = factor(colony, levels = colony))
+
+aa = ggplot(b_year_more, aes(x = (exp(b_year_mean)-1)*100, y = colony)) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "orange") + 
+  geom_point(aes(color = (Q2.5 <= 0 & Q97.5 >= 0)),  # Change color based on overlap with 0
+             size = 2) +
+  geom_errorbarh(aes(xmin = (exp(Q2.5)-1)*100, xmax = (exp(Q97.5)-1)*100, color = (Q2.5 <= 0 & Q97.5 >= 0)),  # Same condition for error bars
+                 height = 0.3, size = 0.7) +
+  scale_color_manual(values = c("TRUE" = "grey", "FALSE" = "black"), guide = FALSE) +  # Map colors
+  labs(x = "Estimated trends (% change per year)", y = "Colony", tag = "A") +
+  theme_minimal() +
+  theme(legend.position = "none")
+  
+ggsave("./Plots/publication/Fig4.pdf", width = 6, height = 9)
+
+png("./Plots/publication/Fig 4.png", width = 10, height = 9, res = 300, units = "in")
+grid.arrange(aa, bb, cc, layout_matrix = matrix(c(1, 1, 1, 2, 3, 3), ncol=2))
+dev.off()
+```
+
+### Colony size map
+```{r posterior data}
+colony_size_posterior2 = colony_size_posterior %>% 
+  rename(mean_year = mean) %>% 
+  group_by(colony, season) %>% 
+  mutate(mean_season = max(mean_year)) %>% 
+  left_join(size.df2[c("colony", "X", "Y")], multiple = "first")
+
+ggplot()+
+  geom_sf(data = texas2_sf, fill = NA, color="black")+
+  coord_sf(xlim = c(bbox$xmin, bbox$xmax), ylim = c(bbox$ymin, bbox$ymax-0.7)) +
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 3, color = "black")+
+  geom_point(data = colony_size_posterior2, aes(x = X, y = Y, size = mean_season/1000000, color = mean_season/1000000)) +
+  scale_color_viridis(direction = 1, begin = 0.3, end = 1, option = "viridis", guide = "legend") + 
+  scale_size_continuous(range = c(1, 8)) +  # Adjust point size range
+  theme_light() +
+  labs(x = "Longitude",
+       y = "Latitude",
+       size = "Counts (millions)",
+       color = "Counts (millions)")+
+  theme(legend.position = "bottom")+
+  facet_wrap(~season)
+```
+
+```{r raw data}
+colony_size <- count.df[c("cluster_ID", "colony", "year","month","local_date", "fake_date", "colony_day_count", "roost_type", "ctr_lon", "ctr_lat")] %>%  
+  unique() %>% 
+  mutate(season = case_when(
+    month %in% c(3, 4, 5) ~ "spring",
+    month %in% c(6, 7, 8) ~ "summer",
+    month %in% c(9, 10, 11) ~ "fall",
+    month %in% c(12, 1, 2) ~ "winter")) %>% 
+  group_by(colony, season, year) %>%
+  filter(n_distinct(local_date) > 5) %>% 
+  ungroup() %>% 
+  group_by(colony, season) %>%
+  mutate(unique_year = n_distinct(year)) %>% 
+  mutate(colony_day_count_90q = quantile(colony_day_count, 0.9, na.rm = TRUE)) %>% 
+  filter(unique_year>2)
+
+coordinates <- st_as_sf(colony_size, coords = c("ctr_lon", "ctr_lat"), crs = 6933)
+coordinates_transformed <- st_transform(coordinates, crs = 4326)
+colony_size <- cbind(colony_size, st_coordinates(coordinates_transformed))
+colony_size$season <- factor(colony_size$season, levels = c("spring", "summer", "fall", "winter"))
+
+png("./Plots/publication/Fig 3.png", width = 9, height = 9, units = "in", res = 600)
+ggplot()+
+  geom_sf(data = texas2_sf, fill = NA, color="grey")+
+  coord_sf(xlim = c(bbox$xmin+0.4, bbox$xmax-0.4), ylim = c(bbox$ymin, bbox$ymax-0.7)) +
+  geom_point(data = colony_size, aes(x = X, y = Y, size = colony_day_count_90q/1000000, color = unique_year)) +
+  geom_sf_text(data = texas_city_sf, aes(label = CITY_NM), size = 3, color = "black")+
+  scale_size_continuous(range = c(1, 8)) +  # Adjust point size range
+  theme_light() +
+  scale_color_viridis()+
+  labs(x = "Longitude",
+       y = "Latitude",
+       size = "Counts (millions)",
+       color = "Persistence (years)")+
+  theme(legend.position = "bottom")+
+  facet_wrap(~season)+
+  theme(panel.spacing = unit(1.3, "lines"))
+dev.off()
+```
+
+## 9. brms Regional trend
+aggregate your data to daily regional counts, decompose the seasonal and trend components, and apply bootstrapping to estimate confidence intervals 
+
+```{r Visulizing raw data}
+daily_regional_data <- count.df %>% select(fake_date, local_date, year, month, yday, day_sum_90q_count) %>% unique()
+
+daily_regional_mean = daily_regional_data %>% group_by(fake_date) %>% 
+  summarise (mean.count = mean(day_sum_90q_count),
+             ninety_perc = quantile(day_sum_90q_count, 0.9),
+             median.count = quantile(day_sum_90q_count, 0.5))
+
+m3 = ggplot() +
+    geom_line(daily_regional_data, 
+              mapping = aes(x = fake_date, y = day_sum_90q_count/1000000, group=year, color = year), alpha = 0.7)+
+    geom_line(daily_regional_mean, mapping = aes(x = fake_date, y = mean.count/1000000), size = 1, color = "black")+
+    scale_x_date(date_breaks = "months", date_labels = "%b")+
+    scale_color_viridis(breaks = seq(2006, 2022, 4))+
+    theme_classic()+
+    labs(x="Month", y="Count (millions)", tag = "C")
+
+pdf("./Plots/publication/Fig 1.pdf", width = 10, height = 8)
+grid.arrange(m1, m2, m3, layout_matrix = matrix(c(1, 3, 2, 3), ncol=2))
+dev.off()
+
+ggplot(daily_regional_data, aes(x = fake_date, y = day_sum_90q_count/1000000, group=year, color = year)) +
+    geom_point()+
+    geom_line()+
+    scale_x_date(date_breaks = "months", date_labels = "%b")+
+    labs(x="Month", y="Count (millions)")+
+    facet_wrap(~year, ncol = 3)+
+    theme_bw()+
+    ggtitle("Regional count")
+```
+
+```{r brms model}
+region_model <- brm(as.integer(day_sum_90q_count) ~ year + (1 + year | month), 
+           data = daily_regional_data, 
+           family = negbinomial(), 
+           chains = 4, iter = 4000, warmup = 2000, cores = 8,
+           control = list(adapt_delta = 0.95, max_treedepth = 15))
+
+# Check model summary
+summary(region_model)
+plot(region_model)
+prior_summary(region_model)
+saveRDS(region_model, "./Data/region_model.rds")
+```
+
+```{r Ridgeline plot monthly trends}
+# Extract posterior samples for random slopes of year by month
+# Filter for the last 1000 iterations
+posterior_samples <- as_draws_df(region_model) 
+#  filter(.iteration > (max(posterior_samples$.iteration) - 1000))  # Extract samples as a dataframe
+
+# Filter for random slopes related to year within month, excluding intercepts
+# These should follow the naming pattern "r_month[MONTH,year]"
+year_slopes <- posterior_samples %>%
+  select(contains("year") & contains("r_month[")) %>%  # Select only the random slopes for year
+  pivot_longer(cols = everything(), names_to = "Month", values_to = "Trend") %>%
+  mutate(Month = str_replace_all(Month, "r_month\\[|,year\\]", ""))  # Clean up month names
+
+# Convert Month to a factor ordered from January to December
+year_slopes$Month <- factor(year_slopes$Month, 
+                            levels = c("1", "2", "3", "4", "5", "6", 
+                                       "7", "8", "9", "10", "11", "12"),
+                            labels = c("January", "February", "March", "April", 
+                                       "May", "June", "July", "August", 
+                                       "September", "October", "November", "December"))
+
+# Calculate the mean and 95% credible intervals for each month
+summary_stats <- year_slopes %>%
+  group_by(Month) %>%
+  summarize(
+    Mean = mean(Trend),
+    Lower_CI = quantile(Trend, 0.025),
+    Upper_CI = quantile(Trend, 0.975)
+  )
+
+# Create a ridgeline plot
+cc = ggplot() +
+  geom_density_ridges(data = year_slopes, 
+                      aes(x = (exp(Trend) - 1) * 100, y = Month, fill = Month), 
+                      scale = 1, rel_min_height = 0.01) +
+  geom_errorbarh(data = summary_stats, 
+                 aes(xmin = (exp(Lower_CI) - 1) * 100, 
+                     xmax = (exp(Upper_CI) - 1) * 100, 
+                     y = Month), 
+                 color = "black", height = 0.3, size = 0.7) +
+  geom_point(data = summary_stats, 
+             aes(x = (exp(Mean) - 1) * 100, y = Month), 
+             color = "black", size = 2, shape = 21, fill = "black") +
+  labs(x = "Estimated trends (% change per year)", 
+       y = "Month", tag = "C") +
+  theme_minimal() +
+  scale_fill_viridis_d() +  # Use _d() for discrete fill values
+  scale_x_continuous(limits = c(-0.3, 0.3)) +  # Adjusted limits for better scale
+  theme(legend.position = "none")
+
+ggsave("./Plots/FigS2.pdf", width = 6, height = 6)
+```
+
+```{r posterior year trend}
+# Extract posterior samples for b_year
+year_posterior_samples <- posterior_samples(region_model, pars = "b_year")
+
+# Plot the posterior distribution
+bb = ggplot(year_posterior_samples, aes(x = (exp(b_year)-1)*100)) +
+  geom_density(fill = "grey", alpha = 0.5) +
+  stat_summary(aes(x = (exp(mean(b_year))-1)*100, y = 0), fun = "mean", geom = "point", color = "black", size = 4) +
+  geom_errorbarh(aes(xmin = quantile((exp(b_year)-1)*100, 0.025), xmax = quantile( (exp(b_year)-1)*100, 0.975), y = 0),
+                 height = 0.05, size = 0.5, color = "black") +
+  labs(x = "Regional trend (% change per year)", y = "Probability density", tag = "B") +
+  theme_minimal()
+```
+
+This discrepancy between the overall regional trend (fixed effect of year) and the random slopes for individual months can be explained by how hierarchical models partition variation between fixed and random effects.
+
+1. Fixed Effect Captures Overall Trend
+The fixed effect for year (-0.03) reflects the average trend across all months. This suggests that, on average, the counts in the region are declining annually.
+This decline represents the broad regional pattern, averaged across all levels of the random effect (month).
+
+2. Random Effects Represent Deviations
+The random slopes for year by month capture month-specific deviations from the overall fixed effect. These deviations indicate how the trend differs in each month compared to the global trend.
+If none of the month-specific random slopes show a significant decline, it means that the monthly deviations from the global trend are not strong enough to demonstrate a significant slope by themselves. This does not contradict the fixed effect, as the latter reflects the aggregated trend.
+
+3. Possible Explanations for Non-Significant Random Slopes
+* Variation Across Months: The overall decline might be consistent but small, and random slopes might lack sufficient power to detect significant trends for individual months.
+* Noise Within Months: Data for some months might have more variability or fewer observations, making it harder to detect a clear trend.
+* Hierarchical Shrinkage: Bayesian models apply shrinkage to random effects, pulling estimates toward the group mean (the fixed effect in this case). This can result in random slopes being closer to zero unless there is very strong evidence for deviation.
+
+4. Model Structure and Priors
+Ensure the model structure is appropriate and the priors are reasonable. For instance, the variance of the random slopes might constrain their estimates, leading to non-significant results. If variance parameters (standard deviations of random slopes) are small, the slopes are likely being heavily regularized.
+
+5. Interpretation
+The fixed effect is the primary indicator of the regional trend. The lack of significant monthly slopes doesn't undermine the overall trend; it simply suggests that month-specific trends are less pronounced or less certain.
